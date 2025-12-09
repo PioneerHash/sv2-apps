@@ -1,0 +1,63 @@
+# Hashrate Multiplexer Configuration Example
+
+[controller]
+# Tuning model: "Aggressive", "Balanced", "Conservative", "ProportionalOnly"
+tuning_model = "Balanced"
+
+# Optional: Custom PID parameters (overrides tuning_model)
+# [controller.custom_pid]
+# kp = 0.5
+# ki = 0.05
+# kd = 0.02
+
+# How often to run rebalancing loop (seconds)
+evaluation_interval_secs = 30
+
+# Deadband: don't rebalance if error < threshold (percentage points)
+# Prevents constant micro-adjustments
+deadband = 0.5
+
+# Minimum time between reassignments for same miner (seconds)
+# Prevents thrashing
+min_reassignment_interval_secs = 30
+
+# Measure distribution based on accepted shares (true) or submitted shares (false)
+measure_on_accepted = true
+
+[failover]
+# Automatically redistribute percentages when upstream fails
+auto_redistribute = true
+
+# Automatically restore percentages when upstream recovers
+auto_restore = true
+
+# Health check interval (seconds)
+health_check_interval_secs = 30
+
+# Upstreams: sorted by priority (1 = highest)
+[[upstreams]]
+id = "pool_a_primary"
+address = "pool-a.example.com"
+port = 3333
+authority_pubkey = "02a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1"
+percentage = 60.0
+priority = 1
+enabled = true
+
+[[upstreams]]
+id = "pool_b_secondary"
+address = "pool-b.example.com"
+port = 3333
+authority_pubkey = "03e4f5g6h7i8j9k0l1m2n3o4p5q6r7s8t9u0v1w2x3y4z5a6b7c8d9e0f1g2h3i4"
+percentage = 30.0
+priority = 2
+enabled = true
+
+[[upstreams]]
+id = "pool_c_backup"
+address = "pool-c.example.com"
+port = 3333
+authority_pubkey = "04i8j9k0l1m2n3o4p5q6r7s8t9u0v1w2x3y4z5a6b7c8d9e0f1g2h3i4j5k6l7m8"
+percentage = 10.0
+priority = 3
+enabled = true

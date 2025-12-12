@@ -1,0 +1,70 @@
+# Hashrate Multiplexer Daemon Configuration
+
+# Downstream (miner) listening configuration
+[downstream]
+address = "0.0.0.0"
+port = 34255
+max_supported_version = 2
+min_supported_version = 2
+supported_extensions = []
+required_extensions = []
+
+# Authority keys for Noise protocol
+[authority]
+public_key = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+secret_key = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iFF"
+
+# PID Controller Configuration
+[controller]
+tuning_model = "Balanced"  # "Aggressive", "Balanced", "Conservative", "ProportionalOnly"
+evaluation_interval_secs = 30
+deadband = 0.5
+min_reassignment_interval_secs = 30
+measure_on_accepted = true
+
+# Failover Configuration
+[failover]
+auto_redistribute = true
+auto_restore = true
+health_check_interval_secs = 30
+
+# Upstream Pools (sorted by priority)
+[[upstreams]]
+id = "pool_a_primary"
+address = "pool-a.example.com"
+port = 3333
+authority_pubkey = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+percentage = 60.0
+priority = 1
+enabled = true
+
+[[upstreams]]
+id = "pool_b_secondary"
+address = "pool-b.example.com"
+port = 3333
+authority_pubkey = "2aKkLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72oe1JVGFauqWEzQDVyd"
+percentage = 30.0
+priority = 2
+enabled = true
+
+[[upstreams]]
+id = "pool_c_backup"
+address = "pool-c.example.com"
+port = 3333
+authority_pubkey = "3xKMLHZtCo2FFqZwtKA5gd9xbuEu7PH72oe1JVGFauqWEzQDVydaK"
+percentage = 10.0
+priority = 3
+enabled = true
+
+# Optional: API Configuration
+# [api]
+# enabled = true
+# address = "127.0.0.1"
+# port = 3000
+# api_key = "your-secret-key-here"
+
+# Optional: Metrics Configuration
+# [metrics]
+# enable_prometheus = true
+# prometheus_address = "0.0.0.0:9090"
+# log_interval_secs = 60

@@ -1,0 +1,61 @@
+[package]
+name = "hashrate-multiplexer"
+version = "0.1.0"
+authors = ["The Stratum V2 Developers"]
+edition = "2021"
+description = "Stratum V2 hashrate multiplexer daemon"
+documentation = "https://docs.rs/hashrate-multiplexer"
+readme = "README.md"
+homepage = "https://stratumprotocol.org"
+repository = "https://github.com/stratum-mining/stratum"
+license = "MIT OR Apache-2.0"
+keywords = ["stratum", "mining", "bitcoin", "protocol", "multiplexer", "proxy"]
+
+[lib]
+name = "hashrate_multiplexer"
+path = "src/lib/mod.rs"
+
+[[bin]]
+name = "hashrate-multiplexer"
+path = "src/main.rs"
+
+[dependencies]
+# Internal dependencies
+multiplexer-core = { path = "../multiplexer-core" }
+stratum-apps = { path = "../../stratum-apps", features = ["network", "config", "core", "with_buffer_pool"] }
+
+# Async runtime
+tokio = { version = "1.44.1", features = ["full"] }
+async-channel = "1.8.0"
+futures = "0.3.28"
+
+# Serialization
+serde = { version = "1.0.89", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# CLI & config
+clap = { version = "4.5.39", features = ["derive"] }
+ext-config = { version = "0.14.0", features = ["toml"], package = "config" }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Utilities
+rand = "0.8"
+
+# REST API (optional for Phase 3)
+# axum = { version = "0.7", optional = true }
+# tower = { version = "0.4", optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[features]
+default = []
+# api = ["axum", "tower"]  # For Phase 3

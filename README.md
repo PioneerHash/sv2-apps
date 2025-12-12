@@ -17,6 +17,8 @@ SV2 Applications
 
 # SV2 Apps Repository
 
+**This branch is about vibe coded multi-plexing.**
+
 This repository contains the application-level crates, currently in **alpha** stage.
 If you're looking for the low-level protocol libraries, check out the [`stratum` repository](https://github.com/stratum-mining/stratum). Those crates provide the foundational protocol implementations used as dependencies by these applications.
 

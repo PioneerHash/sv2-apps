@@ -9,6 +9,7 @@ use crate::{
     sv1::downstream::{data::DownstreamData, SubmitShareWithChannelId},
     utils::validate_sv1_share,
 };
+use ehash_core::parse_hpub_from_username;
 
 // Implements `IsServer` for `Downstream` to handle the Sv1 messages.
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -66,7 +67,27 @@ impl IsServer<'static> for DownstreamData {
     ) -> bool {
         info!("Received mining.authorize from Sv1 downstream");
         debug!("Down: Handling mining.authorize: {:?}", request);
-        true
+
+        // Validate that the username contains a valid hpub before the period
+        // Expected format: "hpub1..." or "hpub1....worker_suffix"
+        let username = &request.name;
+        match parse_hpub_from_username(username) {
+            Some(pubkey) => {
+                info!(
+                    "Down: Valid hpub found in authorize request: {}",
+                    pubkey.to_bech32()
+                );
+                true
+            }
+            None => {
+                warn!(
+                    "Down: Invalid or missing hpub in authorize request. Username: '{}'. \
+                     Expected format: 'hpub1<bech32_data>' or 'hpub1<bech32_data>.worker_suffix'",
+                    username
+                );
+                false
+            }
+        }
     }
 
     fn handle_submit(

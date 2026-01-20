@@ -1572,6 +1572,7 @@ dependencies = [
  "bitcoin_core_sv2",
  "clap",
  "config",
+ "ehash-core",
  "hex",
  "hotpath",
  "serde",

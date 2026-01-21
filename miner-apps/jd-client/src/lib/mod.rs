@@ -30,6 +30,7 @@ use crate::{
 mod channel_manager;
 pub mod config;
 mod downstream;
+pub mod ehash_mint;
 pub mod error;
 mod io_task;
 pub mod jd_mode;

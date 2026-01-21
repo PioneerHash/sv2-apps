@@ -12,6 +12,52 @@ use stratum_apps::{
     utils::types::{SharesBatchSize, SharesPerMinute},
 };
 
+/// ehash-mint connection configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct EhashMintConfig {
+    /// Whether ehash-mint integration is enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// Address of the ehash-mint Sv2 listener
+    pub address: Option<String>,
+    /// Port of the ehash-mint Sv2 listener
+    pub port: Option<u16>,
+    /// Authority public key of the ehash-mint (for Noise authentication)
+    pub authority_pubkey: Option<Secp256k1PublicKey>,
+}
+
+impl Default for EhashMintConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            address: None,
+            port: None,
+            authority_pubkey: None,
+        }
+    }
+}
+
+impl EhashMintConfig {
+    /// Returns the socket address for the ehash-mint if configured.
+    pub fn socket_addr(&self) -> Option<SocketAddr> {
+        match (self.enabled, &self.address, self.port) {
+            (true, Some(addr), Some(port)) => {
+                let addr_str = format!("{}:{}", addr, port);
+                addr_str.parse().ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Check if ehash-mint integration is properly configured.
+    pub fn is_configured(&self) -> bool {
+        self.enabled
+            && self.address.is_some()
+            && self.port.is_some()
+            && self.authority_pubkey.is_some()
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct JobDeclaratorClientConfig {
     // The address on which the JDC will listen for incoming connections when acting as an
@@ -54,6 +100,9 @@ pub struct JobDeclaratorClientConfig {
     /// Optional monitoring server bind address
     #[serde(default)]
     monitoring_address: Option<SocketAddr>,
+    /// ehash-mint configuration for ecash integration
+    #[serde(default)]
+    ehash_mint: EhashMintConfig,
 }
 
 impl JobDeclaratorClientConfig {
@@ -94,12 +143,18 @@ impl JobDeclaratorClientConfig {
             supported_extensions,
             required_extensions,
             monitoring_address: None,
+            ehash_mint: EhashMintConfig::default(),
         }
     }
 
     /// Returns the monitoring server bind address (if enabled)
     pub fn monitoring_address(&self) -> Option<SocketAddr> {
         self.monitoring_address
+    }
+
+    /// Returns the ehash-mint configuration.
+    pub fn ehash_mint(&self) -> &EhashMintConfig {
+        &self.ehash_mint
     }
 
     /// Returns the listening address of the Job Declartor Client.

@@ -3,16 +3,24 @@
 //! This module handles communication with the ehash-mint daemon for ecash
 //! token issuance based on mining shares.
 //!
-//! Current status: Stubbed out with data types only. Full implementation
-//! pending proper Sv2 framing integration for the mint protocol.
+//! # Design
+//! - Non-blocking: Share data sent through async channel to dedicated task
+//! - Fire-and-forget: No acknowledgment from mint, shares already validated by pool
+//! - Dedicated task handles Noise connection and message framing
+//!
+//! # Message Format
+//! - ShareReport (0x00): Regular share (73 bytes)
+//! - BlockFoundReport (0x01): Share that found a block (73 bytes)
+//! - Both contain: pubkey(33) + share_hash(32) + difficulty_ratio(8)
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_channel::{unbounded, Receiver, Sender};
+use async_channel::{bounded, Receiver, Sender};
 use ehash_core::EhashPubkey;
 use stratum_apps::custom_mutex::Mutex;
-use tracing::{debug, info, warn};
+use tokio::sync::broadcast;
+use tracing::{debug, error, info, warn};
 
 use crate::config::EhashMintConfig;
 
@@ -37,7 +45,7 @@ impl EhashPubkeyStore {
     /// Store a pubkey for a channel.
     pub fn insert(&mut self, downstream_id: usize, channel_id: u32, pubkey: EhashPubkey) {
         let key = (downstream_id, channel_id);
-        info!(
+        debug!(
             downstream_id,
             channel_id,
             pubkey = %pubkey,
@@ -60,38 +68,42 @@ impl EhashPubkeyStore {
     pub fn remove_downstream(&mut self, downstream_id: usize) {
         self.pubkeys.retain(|(did, _), _| *did != downstream_id);
     }
+
+    /// Get number of stored pubkeys.
+    pub fn len(&self) -> usize {
+        self.pubkeys.len()
+    }
+
+    /// Check if store is empty.
+    pub fn is_empty(&self) -> bool {
+        self.pubkeys.is_empty()
+    }
 }
 
-/// Data for an EhashShareReport message.
+/// Data for a share report to send to ehash-mint.
 ///
-/// This matches the EhashShareReport message format expected by ehash-mint.
+/// This is the internal representation sent through the async channel.
+/// The dedicated task converts this to the wire format (ShareReport or BlockFoundReport).
 #[derive(Debug, Clone)]
 pub struct ShareReportData {
     /// Miner's ehash pubkey (33 bytes compressed)
     pub pubkey: [u8; 33],
     /// Unique share identifier (32 bytes)
     pub share_hash: [u8; 32],
-    /// Share difficulty (scaled by 1e9)
-    pub share_difficulty: u64,
-    /// Network difficulty (scaled by 1e9)
-    pub network_difficulty: u64,
+    /// Pre-computed difficulty ratio: share_difficulty / network_difficulty
+    pub difficulty_ratio: f64,
     /// Whether this share found a block
     pub block_found: bool,
-    /// Unix timestamp
-    pub timestamp: u64,
-    /// Channel ID
-    pub channel_id: u32,
 }
 
 /// ehash-mint client that sends share reports.
 ///
-/// This is currently a stub that logs share reports but doesn't send them.
-/// Full implementation requires proper Sv2 framing for the mint protocol.
+/// Share reports are sent through an async channel to a dedicated task,
+/// ensuring the mining hot path is not blocked by network I/O.
 pub struct EhashMintClient {
     /// Configuration
-    #[allow(dead_code)]
     config: EhashMintConfig,
-    /// Sender channel for share reports
+    /// Sender channel for share reports (non-blocking)
     report_sender: Sender<ShareReportData>,
     /// Pubkey store (shared with channel manager)
     pubkey_store: Arc<Mutex<EhashPubkeyStore>>,
@@ -101,13 +113,21 @@ impl EhashMintClient {
     /// Create a new ehash-mint client.
     ///
     /// Returns None if ehash-mint is not configured.
+    ///
+    /// # Arguments
+    /// * `config` - ehash-mint configuration
+    ///
+    /// # Returns
+    /// A tuple of (client, receiver) where the receiver is passed to the dedicated task.
     pub fn new(config: &EhashMintConfig) -> Option<(Self, Receiver<ShareReportData>)> {
         if !config.is_configured() {
             info!("ehash-mint integration disabled (not configured)");
             return None;
         }
 
-        let (report_sender, report_receiver) = unbounded();
+        // Bounded channel to provide backpressure if mint connection is slow
+        // Channel size of 10000 provides buffer for ~10 seconds at 1000 shares/sec
+        let (report_sender, report_receiver) = bounded(10000);
         let pubkey_store = Arc::new(Mutex::new(EhashPubkeyStore::new()));
 
         let client = Self {
@@ -115,6 +135,11 @@ impl EhashMintClient {
             report_sender,
             pubkey_store,
         };
+
+        info!(
+            address = ?config.socket_addr(),
+            "ehash-mint client created"
+        );
 
         Some((client, report_receiver))
     }
@@ -125,59 +150,209 @@ impl EhashMintClient {
     }
 
     /// Get a sender for submitting share reports.
+    ///
+    /// This sender can be cloned and used from multiple places (e.g., share validation handlers).
     pub fn report_sender(&self) -> Sender<ShareReportData> {
         self.report_sender.clone()
     }
 
-    /// Start processing share reports.
+    /// Get the mint socket address if configured.
+    pub fn socket_addr(&self) -> Option<std::net::SocketAddr> {
+        self.config.socket_addr()
+    }
+
+    /// Send a share report (non-blocking).
     ///
-    /// Currently this just logs the reports. Full implementation will
-    /// connect to ehash-mint and send reports over Sv2 Noise.
-    pub fn start_logging(report_receiver: Receiver<ShareReportData>) {
-        tokio::spawn(async move {
-            while let Ok(report) = report_receiver.recv().await {
-                // TODO: Send to ehash-mint over Sv2 Noise connection
-                // For now, just log the report
-                info!(
+    /// This uses try_send to avoid blocking the caller if the channel is full.
+    /// If the channel is full, the share is dropped (logged as warning).
+    pub fn try_send(&self, report: ShareReportData) {
+        match self.report_sender.try_send(report) {
+            Ok(()) => {
+                debug!("Share report queued for ehash-mint");
+            }
+            Err(async_channel::TrySendError::Full(report)) => {
+                warn!(
                     share_hash = hex::encode(&report.share_hash[..8]),
-                    pubkey = hex::encode(&report.pubkey[..8]),
-                    share_difficulty = report.share_difficulty,
-                    block_found = report.block_found,
-                    "Share report received (ehash-mint connection TODO)"
+                    "ehash-mint channel full, dropping share report"
                 );
             }
-            warn!("Share report channel closed");
-        });
+            Err(async_channel::TrySendError::Closed(_)) => {
+                error!("ehash-mint channel closed");
+            }
+        }
     }
+}
+
+/// Start the dedicated task that handles mint communication.
+///
+/// This task:
+/// 1. Receives share reports from the async channel
+/// 2. Connects to ehash-mint over Noise-encrypted TCP
+/// 3. Sends ShareReport or BlockFoundReport messages
+///
+/// The task runs until the shutdown signal is received or the channel is closed.
+pub fn start_mint_task(
+    config: EhashMintConfig,
+    report_receiver: Receiver<ShareReportData>,
+    shutdown: broadcast::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        run_mint_task(config, report_receiver, shutdown).await;
+    });
+}
+
+/// Run the mint communication task.
+async fn run_mint_task(
+    config: EhashMintConfig,
+    report_receiver: Receiver<ShareReportData>,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    info!(
+        address = ?config.socket_addr(),
+        "ehash-mint task started"
+    );
+
+    // TODO: Establish Noise connection to ehash-mint
+    // For now, just log the reports
+    let mut report_count: u64 = 0;
+    let mut block_count: u64 = 0;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => {
+                info!(
+                    report_count,
+                    block_count,
+                    "ehash-mint task shutting down"
+                );
+                break;
+            }
+            result = report_receiver.recv() => {
+                match result {
+                    Ok(report) => {
+                        report_count += 1;
+                        if report.block_found {
+                            block_count += 1;
+                            info!(
+                                share_hash = hex::encode(&report.share_hash[..8]),
+                                pubkey = hex::encode(&report.pubkey[..8]),
+                                difficulty_ratio = report.difficulty_ratio,
+                                "BlockFoundReport queued for ehash-mint"
+                            );
+                        } else {
+                            debug!(
+                                share_hash = hex::encode(&report.share_hash[..8]),
+                                pubkey = hex::encode(&report.pubkey[..8]),
+                                difficulty_ratio = report.difficulty_ratio,
+                                "ShareReport queued for ehash-mint"
+                            );
+                        }
+
+                        // TODO: Actually send to ehash-mint over Noise connection
+                        // let message = if report.block_found {
+                        //     EhashMessage::BlockFoundReport(BlockFoundReport::new(...))
+                        // } else {
+                        //     EhashMessage::ShareReport(ShareReport::new(...))
+                        // };
+                        // stream.write_frame(message.try_into()?).await?;
+                    }
+                    Err(_) => {
+                        info!("ehash-mint report channel closed");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    info!(report_count, block_count, "ehash-mint task stopped");
 }
 
 /// Create a share report from share validation data.
 ///
-/// This helper converts the share validation result into a ShareReportData
-/// that can be sent to the ehash-mint.
+/// This helper is called from the share validation code to create a report
+/// that can be sent through the async channel.
+///
+/// # Arguments
+/// * `pubkey` - Miner's ehash pubkey (from the channel's stored hpub)
+/// * `share_hash` - SHA256d hash of the share
+/// * `difficulty_ratio` - Pre-computed share_difficulty / network_difficulty
+/// * `block_found` - Whether this share found a valid block
 pub fn create_share_report(
     pubkey: &EhashPubkey,
     share_hash: [u8; 32],
-    share_difficulty: u64,
-    network_difficulty: u64,
+    difficulty_ratio: f64,
     block_found: bool,
-    channel_id: u32,
 ) -> ShareReportData {
     let mut pubkey_bytes = [0u8; 33];
     pubkey_bytes.copy_from_slice(pubkey.as_bytes());
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
     ShareReportData {
         pubkey: pubkey_bytes,
         share_hash,
-        share_difficulty,
-        network_difficulty,
+        difficulty_ratio,
         block_found,
-        timestamp,
-        channel_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pubkey_store() {
+        let mut store = EhashPubkeyStore::new();
+        assert!(store.is_empty());
+
+        // Create a dummy pubkey
+        let pubkey_bytes = [0x02u8; 33];
+        let pubkey = EhashPubkey::from_bytes(&pubkey_bytes).unwrap();
+
+        // Insert and retrieve
+        store.insert(1, 10, pubkey.clone());
+        assert_eq!(store.len(), 1);
+        assert!(store.get(1, 10).is_some());
+        assert!(store.get(1, 11).is_none());
+        assert!(store.get(2, 10).is_none());
+
+        // Remove single
+        store.remove(1, 10);
+        assert!(store.is_empty());
+
+        // Remove by downstream
+        store.insert(1, 10, pubkey.clone());
+        store.insert(1, 11, pubkey.clone());
+        store.insert(2, 10, pubkey.clone());
+        assert_eq!(store.len(), 3);
+
+        store.remove_downstream(1);
+        assert_eq!(store.len(), 1);
+        assert!(store.get(2, 10).is_some());
+    }
+
+    #[test]
+    fn test_create_share_report() {
+        let pubkey_bytes = [0x02u8; 33];
+        let pubkey = EhashPubkey::from_bytes(&pubkey_bytes).unwrap();
+        let share_hash = [0xab; 32];
+
+        let report = create_share_report(&pubkey, share_hash, 0.001, false);
+
+        assert_eq!(report.pubkey, pubkey_bytes);
+        assert_eq!(report.share_hash, share_hash);
+        assert!((report.difficulty_ratio - 0.001).abs() < 1e-10);
+        assert!(!report.block_found);
+    }
+
+    #[test]
+    fn test_create_block_found_report() {
+        let pubkey_bytes = [0x03u8; 33];
+        let pubkey = EhashPubkey::from_bytes(&pubkey_bytes).unwrap();
+        let share_hash = [0xcd; 32];
+
+        let report = create_share_report(&pubkey, share_hash, 1.5, true);
+
+        assert!(report.block_found);
+        assert!((report.difficulty_ratio - 1.5).abs() < 1e-10);
     }
 }

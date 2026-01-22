@@ -274,8 +274,9 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 ));
             }
         };
-        // hpub is available for future use (e.g., ecash minting)
-        let _ = hpub;
+        // Store hpub for ehash minting - will be associated with channel_id after channel opens
+        // TODO: Wire this into EhashPubkeyStore once channel_id is assigned below
+        let _ehash_pubkey = hpub;
 
         let coinbase_outputs = self
             .channel_manager_data
@@ -600,8 +601,9 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 ));
             }
         };
-        // hpub is available for future use (e.g., ecash minting)
-        let _ = hpub;
+        // Store hpub for ehash minting - will be associated with channel_id after channel opens
+        // TODO: Wire this into EhashPubkeyStore once channel_id is assigned below
+        let _ehash_pubkey = hpub;
 
         let nominal_hash_rate = msg.nominal_hash_rate;
         let requested_max_target =

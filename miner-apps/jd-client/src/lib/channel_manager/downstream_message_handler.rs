@@ -241,9 +241,11 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
 
-        // Validate that the user_identity contains a valid hpub
+        // Parse hpub from user_identity if present
         // Expected format: "hpub1..." or "hpub1....worker_suffix"
-        let hpub = match parse_hpub_from_username(&user_identity) {
+        // Note: We allow channels without hpub - they just won't receive ehash tokens
+        // The hpub can be updated later via TLV on share submissions
+        let ehash_pubkey = match parse_hpub_from_username(&user_identity) {
             Some(pubkey) => {
                 info!(
                     downstream_id,
@@ -255,28 +257,13 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             None => {
                 warn!(
                     downstream_id,
-                    "Invalid or missing hpub in user_identity: '{}'. \
-                     Expected format: 'hpub1<bech32_data>' or 'hpub1<bech32_data>.worker_suffix'",
+                    "No hpub in user_identity: '{}'. ehash tokens will not be issued for this channel \
+                     unless hpub is provided via TLV on share submissions.",
                     user_identity
                 );
-                let error_msg = Mining::OpenMiningChannelError(OpenMiningChannelError {
-                    request_id,
-                    error_code: "invalid-user-identity-no-hpub-found"
-                        .to_string()
-                        .try_into()
-                        .expect("valid error code"),
-                });
-                let _ = RouteMessageTo::Downstream((downstream_id, error_msg))
-                    .forward(&self.channel_manager_channel)
-                    .await;
-                return Err(JDCError::disconnect(
-                    JDCErrorKind::InvalidUserIdentity(user_identity.to_string()),
-                    downstream_id,
-                ));
+                None
             }
         };
-        // Store hpub for ehash minting - will be associated with channel_id after channel opens
-        let ehash_pubkey = hpub;
 
         let coinbase_outputs = self
             .channel_manager_data
@@ -576,9 +563,11 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         info!(downstream_id, "Received: {}", msg);
         let request_id = msg.get_request_id_as_u32();
 
-        // Validate that the user_identity contains a valid hpub
+        // Parse hpub from user_identity if present
         // Expected format: "hpub1..." or "hpub1....worker_suffix"
-        let hpub = match parse_hpub_from_username(&user_identity) {
+        // Note: We allow channels without hpub - they just won't receive ehash tokens
+        // The hpub can be updated later via TLV on share submissions
+        let ehash_pubkey = match parse_hpub_from_username(&user_identity) {
             Some(pubkey) => {
                 info!(
                     downstream_id,
@@ -590,28 +579,13 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             None => {
                 warn!(
                     downstream_id,
-                    "Invalid or missing hpub in user_identity: '{}'. \
-                     Expected format: 'hpub1<bech32_data>' or 'hpub1<bech32_data>.worker_suffix'",
+                    "No hpub in user_identity: '{}'. ehash tokens will not be issued for this channel \
+                     unless hpub is provided via TLV on share submissions.",
                     user_identity
                 );
-                let error_msg = Mining::OpenMiningChannelError(OpenMiningChannelError {
-                    request_id,
-                    error_code: "invalid-user-identity-no-hpub"
-                        .to_string()
-                        .try_into()
-                        .expect("valid error code"),
-                });
-                let _ = RouteMessageTo::Downstream((downstream_id, error_msg))
-                    .forward(&self.channel_manager_channel)
-                    .await;
-                return Err(JDCError::disconnect(
-                    JDCErrorKind::InvalidUserIdentity(user_identity.to_string()),
-                    downstream_id,
-                ));
+                None
             }
         };
-        // Store hpub for ehash minting - will be associated with channel_id after channel opens
-        let ehash_pubkey = hpub;
 
         let nominal_hash_rate = msg.nominal_hash_rate;
         let requested_max_target =

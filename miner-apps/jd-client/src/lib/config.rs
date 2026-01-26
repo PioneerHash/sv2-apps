@@ -24,6 +24,9 @@ pub struct EhashMintConfig {
     pub port: Option<u16>,
     /// Authority public key of the ehash-mint (for Noise authentication)
     pub authority_pubkey: Option<Secp256k1PublicKey>,
+    /// Optional path to fallback log file when connection is down and buffer is full.
+    /// Defaults to /tmp/ehash-reports-fallback.log
+    pub fallback_log_path: Option<PathBuf>,
 }
 
 impl Default for EhashMintConfig {
@@ -33,6 +36,7 @@ impl Default for EhashMintConfig {
             address: None,
             port: None,
             authority_pubkey: None,
+            fallback_log_path: None,
         }
     }
 }

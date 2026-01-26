@@ -59,6 +59,7 @@ use crate::{
     channel_manager::downstream_message_handler::RouteMessageTo,
     config::JobDeclaratorClientConfig,
     downstream::Downstream,
+    ehash_mint::{EhashPubkeyStore, ShareReportSender},
     error::{self, JDCError, JDCErrorKind, JDCResult},
     status::{handle_error, Status, StatusSender},
     utils::{
@@ -157,6 +158,10 @@ pub struct ChannelManagerData {
     supported_extensions: Vec<u16>,
     /// Extensions that the JDC requires
     required_extensions: Vec<u16>,
+    /// Stores the mapping of (downstream_id, channel_id) → EhashPubkey for ehash minting
+    pub ehash_pubkey_store: EhashPubkeyStore,
+    /// Sender for share reports to ehash-mint (no-op if ehash-mint not configured)
+    pub ehash_report_sender: ShareReportSender,
 }
 
 impl ChannelManagerData {
@@ -195,6 +200,10 @@ impl ChannelManagerData {
         self.pool_tag_string = None;
 
         self.coinbase_outputs = coinbase_outputs;
+
+        // Clear ehash pubkey store on reset (channels are being reset)
+        self.ehash_pubkey_store = EhashPubkeyStore::new();
+        // Note: ehash_report_sender is preserved - connection to mint stays open
     }
 }
 
@@ -272,6 +281,7 @@ impl ChannelManager {
         coinbase_outputs: Vec<u8>,
         supported_extensions: Vec<u16>,
         required_extensions: Vec<u16>,
+        ehash_report_sender: ShareReportSender,
     ) -> JDCResult<Self, error::ChannelManager> {
         let (range_0, range_1, range_2) = {
             let range_1 = 0..JDC_SEARCH_SPACE_BYTES;
@@ -313,6 +323,8 @@ impl ChannelManager {
             negotiated_extensions: vec![],
             supported_extensions,
             required_extensions,
+            ehash_pubkey_store: EhashPubkeyStore::new(),
+            ehash_report_sender,
         }));
 
         let channel_manager_channel = ChannelManagerChannel {
@@ -582,6 +594,8 @@ impl ChannelManager {
             cm_data
                 .vardiff
                 .retain(|key, _| key.downstream_id != downstream_id);
+            // Clean up ehash pubkey store entries for this downstream
+            cm_data.ehash_pubkey_store.remove_downstream(downstream_id);
         });
         Ok(())
     }

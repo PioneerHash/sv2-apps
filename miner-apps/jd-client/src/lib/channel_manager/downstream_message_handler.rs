@@ -4,7 +4,7 @@ use ehash_core::parse_hpub_from_username;
 use stratum_apps::{
     stratum_core::{
         binary_sv2::Str0255,
-        bitcoin::{Amount, Target},
+        bitcoin::{Amount, CompactTarget, Target},
         channels_sv2::{
             client,
             outputs::deserialize_outputs,
@@ -33,6 +33,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     channel_manager::{ChannelManager, ChannelManagerChannel, FULL_EXTRANONCE_SIZE},
+    ehash_mint::create_share_report,
     error::{self, JDCError, JDCErrorKind},
     jd_mode::{get_jd_mode, JdMode},
     utils::create_close_channel_msg,
@@ -275,8 +276,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             }
         };
         // Store hpub for ehash minting - will be associated with channel_id after channel opens
-        // TODO: Wire this into EhashPubkeyStore once channel_id is assigned below
-        let _ehash_pubkey = hpub;
+        let ehash_pubkey = hpub;
 
         let coinbase_outputs = self
             .channel_manager_data
@@ -528,6 +528,15 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             group_channel.add_standard_channel_id(standard_channel_id);
                         }
 
+                        // Store ehash pubkey for this channel (for share reporting to ehash-mint)
+                        if let Some(pubkey) = ehash_pubkey.as_ref() {
+                            channel_manager_data.ehash_pubkey_store.insert(
+                                downstream_id,
+                                standard_channel_id,
+                                pubkey.clone(),
+                            );
+                        }
+
                         Ok(messages)
                     })
                 })?;
@@ -602,8 +611,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             }
         };
         // Store hpub for ehash minting - will be associated with channel_id after channel opens
-        // TODO: Wire this into EhashPubkeyStore once channel_id is assigned below
-        let _ehash_pubkey = hpub;
+        let ehash_pubkey = hpub;
 
         let nominal_hash_rate = msg.nominal_hash_rate;
         let requested_max_target =
@@ -769,6 +777,15 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
                         channel_manager_data.downstream_channel_id_and_job_id_to_template_id.insert((downstream_id, extended_channel_id, future_extended_job_id).into(), last_future_template.template_id);
                         channel_manager_data.vardiff.insert((downstream_id, extended_channel_id).into(), vardiff);
+
+                        // Store ehash pubkey for this channel (for share reporting to ehash-mint)
+                        if let Some(pubkey) = ehash_pubkey.as_ref() {
+                            channel_manager_data.ehash_pubkey_store.insert(
+                                downstream_id,
+                                extended_channel_id,
+                                pubkey.clone(),
+                            );
+                        }
 
                         Ok(messages)
                     })
@@ -1026,9 +1043,17 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 };
                 vardiff.increment_shares_since_last_update();
                 let res = standard_channel.validate_share(msg.clone());
+
+                // Capture share data for ehash reporting
+                let mut ehash_share_hash: Option<[u8; 32]> = None;
+                let mut ehash_block_found = false;
+
                 let mut is_downstream_share_valid = false;
                 match res {
                     Ok(ShareValidationResult::Valid(share_hash)) => {
+                        // Capture for ehash
+                        ehash_share_hash = Some(*share_hash.as_ref());
+
                         let share_accounting = standard_channel.get_share_accounting();
                         if share_accounting.should_acknowledge() {
                             let success = SubmitSharesSuccess {
@@ -1048,6 +1073,10 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         is_downstream_share_valid = true;
                     }
                     Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase)) => {
+                        // Capture for ehash
+                        ehash_share_hash = Some(*share_hash.as_ref());
+                        ehash_block_found = true;
+
                         info!("SubmitSharesStandard on downstream channel: 💰 Block Found!!! 💰{share_hash}");
                         is_downstream_share_valid = true;
                         if let Some(template_id) = template_id {
@@ -1090,6 +1119,28 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
                 if !is_downstream_share_valid {
                     return Ok(messages);
+                }
+
+                // Send ehash share report
+                if let Some(share_hash) = ehash_share_hash {
+                    if let Some(ehash_pubkey) = channel_manager_data.ehash_pubkey_store.get(downstream_id, channel_id) {
+                        // Calculate difficulty ratio: channel_difficulty / network_difficulty
+                        let channel_target = standard_channel.get_target();
+                        let network_target = Target::from_compact(CompactTarget::from_consensus(prev_hash.n_bits));
+
+                        let channel_difficulty = channel_target.difficulty_float();
+                        let network_difficulty = network_target.difficulty_float();
+                        let difficulty_ratio = channel_difficulty / network_difficulty;
+
+                        let report = create_share_report(
+                            ehash_pubkey,
+                            share_hash,
+                            difficulty_ratio,
+                            ehash_block_found,
+                        );
+
+                        channel_manager_data.ehash_report_sender.try_send(report);
+                    }
                 }
 
                 if let Some(upstream_channel) = channel_manager_data.upstream_channel.as_mut() {
@@ -1237,9 +1288,17 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 };
                 vardiff.increment_shares_since_last_update();
                 let res = extended_channel.validate_share(msg.clone());
+
+                // Capture share data for ehash reporting
+                let mut ehash_share_hash: Option<[u8; 32]> = None;
+                let mut ehash_block_found = false;
+
                 let mut is_downstream_share_valid = false;
                 match res {
                     Ok(ShareValidationResult::Valid(share_hash)) => {
+                        // Capture for ehash
+                        ehash_share_hash = Some(*share_hash.as_ref());
+
                         let share_accounting = extended_channel.get_share_accounting();
                         if share_accounting.should_acknowledge() {
                             let success = SubmitSharesSuccess {
@@ -1259,6 +1318,10 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         is_downstream_share_valid = true;
                     }
                     Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase)) => {
+                        // Capture for ehash
+                        ehash_share_hash = Some(*share_hash.as_ref());
+                        ehash_block_found = true;
+
                         info!("SubmitSharesExtended on downstream channel: 💰 Block Found!!! 💰{share_hash}");
                         if let Some(template_id) = template_id {
                             info!("SubmitSharesExtended: Propagating solution to the Template Provider.");
@@ -1300,6 +1363,28 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
                 if !is_downstream_share_valid{
                     return Ok(messages);
+                }
+
+                // Send ehash share report
+                if let Some(share_hash) = ehash_share_hash {
+                    if let Some(ehash_pubkey) = channel_manager_data.ehash_pubkey_store.get(downstream_id, channel_id) {
+                        // Calculate difficulty ratio: channel_difficulty / network_difficulty
+                        let channel_target = extended_channel.get_target();
+                        let network_target = Target::from_compact(CompactTarget::from_consensus(prev_hash.n_bits));
+
+                        let channel_difficulty = channel_target.difficulty_float();
+                        let network_difficulty = network_target.difficulty_float();
+                        let difficulty_ratio = channel_difficulty / network_difficulty;
+
+                        let report = create_share_report(
+                            ehash_pubkey,
+                            share_hash,
+                            difficulty_ratio,
+                            ehash_block_found,
+                        );
+
+                        channel_manager_data.ehash_report_sender.try_send(report);
+                    }
                 }
 
                 if let Some(upstream_channel) = channel_manager_data.upstream_channel.as_mut() {

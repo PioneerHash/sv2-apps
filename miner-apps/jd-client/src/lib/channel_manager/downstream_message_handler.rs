@@ -33,7 +33,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     channel_manager::{ChannelManager, ChannelManagerChannel, FULL_EXTRANONCE_SIZE},
-    ehash_mint::create_share_report,
+    ehash_mint::{create_share_report, PendingChannelShares, PendingShareData},
     error::{self, JDCError, JDCErrorKind},
     jd_mode::{get_jd_mode, JdMode},
     utils::create_close_channel_msg,
@@ -1339,25 +1339,61 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     return Ok(messages);
                 }
 
-                // Send ehash share report
+                // Send ehash share report (or buffer if no hpub registered yet)
                 if let Some(share_hash) = ehash_share_hash {
+                    // Calculate difficulty ratio: channel_difficulty / network_difficulty
+                    let channel_target = extended_channel.get_target();
+                    let network_target = Target::from_compact(CompactTarget::from_consensus(prev_hash.n_bits));
+                    let channel_difficulty = channel_target.difficulty_float();
+                    let network_difficulty = network_target.difficulty_float();
+                    let difficulty_ratio = channel_difficulty / network_difficulty;
+
                     if let Some(ehash_pubkey) = channel_manager_data.ehash_pubkey_store.get(downstream_id, channel_id) {
-                        // Calculate difficulty ratio: channel_difficulty / network_difficulty
-                        let channel_target = extended_channel.get_target();
-                        let network_target = Target::from_compact(CompactTarget::from_consensus(prev_hash.n_bits));
-
-                        let channel_difficulty = channel_target.difficulty_float();
-                        let network_difficulty = network_target.difficulty_float();
-                        let difficulty_ratio = channel_difficulty / network_difficulty;
-
+                        // hpub is registered, send report directly
                         let report = create_share_report(
                             ehash_pubkey,
                             share_hash,
                             difficulty_ratio,
                             ehash_block_found,
                         );
-
                         channel_manager_data.ehash_report_sender.try_send(report);
+                    } else {
+                        // No hpub registered yet - buffer the share and check timeout
+                        let key = (downstream_id, channel_id);
+                        let pending = channel_manager_data.pending_ehash_shares
+                            .entry(key)
+                            .or_insert_with(|| {
+                                let timeout = channel_manager_data.ehash_pubkey_timeout_secs;
+                                info!(
+                                    downstream_id, channel_id, timeout,
+                                    "Share received before RegisterChannelPubkey, starting buffer"
+                                );
+                                PendingChannelShares::new(timeout)
+                            });
+
+                        // Check if timeout has expired
+                        if pending.is_expired() {
+                            error!(
+                                downstream_id, channel_id,
+                                "RegisterChannelPubkey not received within timeout, disconnecting"
+                            );
+                            return Err(JDCError::disconnect(
+                                JDCErrorKind::EhashPubkeyTimeout,
+                                downstream_id,
+                            ));
+                        }
+
+                        // Buffer the share
+                        pending.push(PendingShareData {
+                            share_hash,
+                            difficulty_ratio,
+                            block_found: ehash_block_found,
+                        });
+                        debug!(
+                            downstream_id, channel_id,
+                            buffered_count = pending.shares.len(),
+                            "Buffered share awaiting RegisterChannelPubkey"
+                        );
                     }
                 }
 

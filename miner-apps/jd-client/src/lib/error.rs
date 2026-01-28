@@ -172,6 +172,8 @@ pub enum JDCErrorKind {
     UnexpectedMessage(ExtensionType, MessageType),
     /// Invalid user identity
     InvalidUserIdentity(String),
+    /// Timeout waiting for RegisterChannelPubkey message
+    EhashPubkeyTimeout,
     /// Bitcoin encode error
     BitcoinEncodeError(bitcoin::consensus::encode::Error),
     /// Invalid socket address
@@ -274,6 +276,7 @@ impl fmt::Display for JDCErrorKind {
                 write!(f, "Unexpected Message: {extension_type} {message_type}")
             }
             InvalidUserIdentity(_) => write!(f, "User ID is invalid"),
+            EhashPubkeyTimeout => write!(f, "Timeout waiting for RegisterChannelPubkey"),
             BitcoinEncodeError(_) => write!(f, "Error generated during encoding"),
             InvalidSocketAddress(ref s) => write!(f, "Invalid socket address: {s}"),
             Timeout => write!(f, "Time out error"),

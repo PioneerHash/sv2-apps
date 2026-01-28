@@ -3,6 +3,7 @@ pub(super) mod data;
 pub mod downstream;
 mod message_handler;
 
+use ehash_core::EhashPubkey;
 use stratum_apps::{
     stratum_core::sv1_api::{client_to_server::Submit, utils::HexU32Be},
     utils::types::{ChannelId, DownstreamId},
@@ -20,6 +21,21 @@ pub enum DownstreamMessages {
     /// Request to open an extended mining channel for a downstream that just sent its first
     /// message.
     OpenChannel(DownstreamId), // downstream_id
+    /// Register an ehash pubkey for a channel after mining.authorize is received.
+    /// Sent from downstream to SV1 server, which forwards it to JDC via SV2.
+    RegisterChannelPubkey(RegisterChannelPubkeyRequest),
+}
+
+/// Request to register an ehash pubkey for a channel.
+///
+/// This is sent from downstream after mining.authorize to associate the miner's
+/// hpub with their SV2 channel for ehash token issuance.
+#[derive(Debug, Clone)]
+pub struct RegisterChannelPubkeyRequest {
+    /// The SV2 channel ID to associate with this pubkey
+    pub channel_id: ChannelId,
+    /// The miner's ehash public key (parsed from mining.authorize username)
+    pub pubkey: EhashPubkey,
 }
 
 /// A wrapper around a `mining.submit` message with additional channel information.

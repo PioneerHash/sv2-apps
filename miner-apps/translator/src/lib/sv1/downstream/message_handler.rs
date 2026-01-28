@@ -100,18 +100,32 @@ impl IsServer<'static> for DownstreamData {
                 "Received mining.submit from SV1 downstream for channel id: {}",
                 channel_id
             );
-            let is_valid_share = validate_sv1_share(
+            let validation_result = validate_sv1_share(
                 request,
                 self.target,
                 self.extranonce1.clone(),
                 self.version_rolling_mask.clone(),
                 self.sv1_server_data.clone(),
                 channel_id,
-            )
-            .unwrap_or(false);
-            if !is_valid_share {
-                error!("Invalid share for channel id: {}", channel_id);
-                return false;
+            );
+            match validation_result {
+                Ok(true) => {
+                    // Share is valid, continue
+                }
+                Ok(false) => {
+                    error!(
+                        "Invalid share for channel id: {} (share doesn't meet target)",
+                        channel_id
+                    );
+                    return false;
+                }
+                Err(e) => {
+                    error!(
+                        "Share validation error for channel id: {}, job_id: {}, error: {:?}",
+                        channel_id, request.job_id, e
+                    );
+                    return false;
+                }
             }
             let to_send: SubmitShareWithChannelId = SubmitShareWithChannelId {
                 channel_id,

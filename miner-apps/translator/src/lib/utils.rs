@@ -60,17 +60,33 @@ pub fn validate_sv1_share(
         .super_safe_lock(|server_data| {
             if let Some(ref aggregated_jobs) = server_data.aggregated_valid_jobs {
                 // Aggregated mode: search in shared jobs
+                debug!(
+                    "Looking for job_id '{}' in aggregated_valid_jobs ({} jobs)",
+                    job_id,
+                    aggregated_jobs.len()
+                );
                 aggregated_jobs
                     .iter()
                     .find(|job| job.job_id == job_id)
                     .cloned()
             } else if let Some(ref non_aggregated_jobs) = server_data.non_aggregated_valid_jobs {
                 // Non-aggregated mode: search in channel-specific jobs
-                non_aggregated_jobs
-                    .get(&channel_id)
+                let channel_jobs = non_aggregated_jobs.get(&channel_id);
+                debug!(
+                    "Looking for job_id '{}' in non_aggregated_valid_jobs for channel_id {}: found {} jobs, available channels: {:?}",
+                    job_id,
+                    channel_id,
+                    channel_jobs.map(|j| j.len()).unwrap_or(0),
+                    non_aggregated_jobs.keys().collect::<Vec<_>>()
+                );
+                if let Some(jobs) = channel_jobs {
+                    debug!("Available job_ids for channel {}: {:?}", channel_id, jobs.iter().map(|j| &j.job_id).collect::<Vec<_>>());
+                }
+                channel_jobs
                     .and_then(|channel_jobs| channel_jobs.iter().find(|job| job.job_id == job_id))
                     .cloned()
             } else {
+                debug!("No valid_jobs storage configured!");
                 None
             }
         })

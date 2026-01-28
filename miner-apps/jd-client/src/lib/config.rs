@@ -27,6 +27,10 @@ pub struct EhashMintConfig {
     /// Optional path to fallback log file when connection is down and buffer is full.
     /// Defaults to /tmp/ehash-reports-fallback.log
     pub fallback_log_path: Option<PathBuf>,
+    /// Timeout in seconds for receiving RegisterChannelPubkey after channel open.
+    /// If exceeded, the downstream is disconnected. Defaults to 5 seconds.
+    #[serde(default)]
+    pub pubkey_timeout_secs: Option<u64>,
 }
 
 impl Default for EhashMintConfig {
@@ -37,6 +41,7 @@ impl Default for EhashMintConfig {
             port: None,
             authority_pubkey: None,
             fallback_log_path: None,
+            pubkey_timeout_secs: Some(5),
         }
     }
 }
@@ -159,6 +164,11 @@ impl JobDeclaratorClientConfig {
     /// Returns the ehash-mint configuration.
     pub fn ehash_mint(&self) -> &EhashMintConfig {
         &self.ehash_mint
+    }
+
+    /// Returns the timeout in seconds for receiving RegisterChannelPubkey.
+    pub fn ehash_pubkey_timeout_secs(&self) -> Option<u64> {
+        self.ehash_mint.pubkey_timeout_secs
     }
 
     /// Returns the listening address of the Job Declartor Client.

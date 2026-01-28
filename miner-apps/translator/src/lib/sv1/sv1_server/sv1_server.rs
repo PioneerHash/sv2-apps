@@ -3,7 +3,7 @@ use crate::{
     error::{self, TproxyError, TproxyErrorKind, TproxyResult},
     status::{handle_error, Status, StatusSender},
     sv1::{
-        downstream::{downstream::Downstream, DownstreamMessages},
+        downstream::{downstream::Downstream, DownstreamMessages, RegisterChannelPubkeyRequest},
         sv1_server::{
             channel::Sv1ServerChannelState, data::Sv1ServerData,
             difficulty_manager::DifficultyManager,
@@ -91,11 +91,15 @@ impl Sv1Server {
         listener_addr: SocketAddr,
         channel_manager_receiver: Receiver<(Mining<'static>, Option<Vec<Tlv>>)>,
         channel_manager_sender: Sender<(Mining<'static>, Option<Vec<Tlv>>)>,
+        ehash_upstream_sender: Sender<stratum_apps::utils::types::Sv2Frame>,
         config: TranslatorConfig,
     ) -> Self {
         let shares_per_minute = config.downstream_difficulty_config.shares_per_minute;
-        let sv1_server_channel_state =
-            Sv1ServerChannelState::new(channel_manager_receiver, channel_manager_sender);
+        let sv1_server_channel_state = Sv1ServerChannelState::new(
+            channel_manager_receiver,
+            channel_manager_sender,
+            ehash_upstream_sender,
+        );
         let sv1_server_data = Arc::new(Mutex::new(Sv1ServerData::new(config.aggregate_channels)));
         Self {
             sv1_server_channel_state,
@@ -342,6 +346,9 @@ impl Sv1Server {
             DownstreamMessages::OpenChannel(downstream_id) => {
                 return self.handle_open_channel_request(downstream_id).await;
             }
+            DownstreamMessages::RegisterChannelPubkey(request) => {
+                return self.handle_register_channel_pubkey(request).await;
+            }
         }
     }
 
@@ -409,10 +416,11 @@ impl Sv1Server {
                     .downstream_data
                     .super_safe_lock(|d| d.user_identity.clone())
             });
+            // UserIdentity is limited to 32 bytes. If it's longer (e.g. hpub), skip the TLV.
+            // For ehash, the miner's hpub is sent via RegisterChannelPubkey instead.
             UserIdentity::new(&user_identity_string)
-                .unwrap()
-                .to_tlv()
                 .ok()
+                .and_then(|ui| ui.to_tlv().ok())
                 .map(|tlv| vec![tlv])
         } else {
             None
@@ -455,6 +463,71 @@ impl Sv1Server {
             );
         }
 
+        Ok(())
+    }
+
+    /// Handles RegisterChannelPubkey messages from downstream.
+    ///
+    /// This sends a RegisterChannelPubkey ehash extension message to the upstream JDC
+    /// to associate the miner's hpub with their SV2 channel for ehash token issuance.
+    async fn handle_register_channel_pubkey(
+        self: &Arc<Self>,
+        request: RegisterChannelPubkeyRequest,
+    ) -> TproxyResult<(), error::Sv1Server> {
+        use ehash_sv2::{EhashMessage, RegisterChannelPubkey};
+        use stratum_apps::stratum_core::{
+            buffer_sv2::Slice, framing_sv2::framing::Sv2Frame, parsers_sv2::IsSv2Message,
+        };
+
+        info!(
+            "SV1 Server: Sending RegisterChannelPubkey for channel_id={}, pubkey={}",
+            request.channel_id,
+            request.pubkey.to_bech32()
+        );
+
+        // Convert EhashPubkey to CompressedPubKey
+        let pubkey_bytes = request.pubkey.as_bytes().to_vec();
+        let pubkey: ehash_sv2::binary_sv2::CompressedPubKey = pubkey_bytes
+            .try_into()
+            .map_err(|_| TproxyError::shutdown(TproxyErrorKind::SV1Error))?;
+
+        // Create the RegisterChannelPubkey message
+        let register_msg = RegisterChannelPubkey::new(request.channel_id, pubkey);
+        let ehash_msg: EhashMessage<'static> = register_msg.into();
+
+        // Create Sv2 frame
+        let message_type = ehash_msg.message_type();
+        let extension_type = ehash_msg.extension_type();
+        let channel_bit = ehash_msg.channel_bit();
+
+        let frame: Sv2Frame<EhashMessage<'static>, Slice> =
+            Sv2Frame::from_message(ehash_msg, message_type, extension_type, channel_bit)
+                .ok_or_else(|| TproxyError::shutdown(TproxyErrorKind::SV1Error))?;
+
+        // Get frame size and serialize
+        let frame_size = frame.encoded_length();
+        let mut frame_bytes = vec![0u8; frame_size];
+        frame
+            .serialize(&mut frame_bytes)
+            .map_err(|_| TproxyError::shutdown(TproxyErrorKind::SV1Error))?;
+
+        // Convert to the upstream frame type and send
+        let upstream_frame =
+            stratum_apps::utils::types::Sv2Frame::from_bytes_unchecked(frame_bytes.into());
+
+        self.sv1_server_channel_state
+            .ehash_upstream_sender
+            .send(upstream_frame)
+            .await
+            .map_err(|e| {
+                error!("Failed to send RegisterChannelPubkey to upstream: {:?}", e);
+                TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
+            })?;
+
+        info!(
+            "RegisterChannelPubkey sent successfully for channel_id={}",
+            request.channel_id
+        );
         Ok(())
     }
 
@@ -1045,10 +1118,11 @@ mod tests {
     fn create_test_sv1_server() -> Sv1Server {
         let (cm_sender, _cm_receiver) = unbounded();
         let (_downstream_sender, cm_receiver) = unbounded();
+        let (ehash_sender, _ehash_receiver) = unbounded();
         let config = create_test_config();
         let addr = "127.0.0.1:3333".parse().unwrap();
 
-        Sv1Server::new(addr, cm_receiver, cm_sender, config)
+        Sv1Server::new(addr, cm_receiver, cm_sender, ehash_sender, config)
     }
 
     #[test]
@@ -1070,9 +1144,10 @@ mod tests {
 
         let (cm_sender, _cm_receiver) = unbounded();
         let (_downstream_sender, cm_receiver) = unbounded();
+        let (ehash_sender, _ehash_receiver) = unbounded();
         let addr = "127.0.0.1:3333".parse().unwrap();
 
-        let server = Sv1Server::new(addr, cm_receiver, cm_sender, config);
+        let server = Sv1Server::new(addr, cm_receiver, cm_sender, ehash_sender, config);
 
         assert!(server.config.aggregate_channels);
         assert!(server.config.downstream_difficulty_config.enable_vardiff);
@@ -1086,9 +1161,10 @@ mod tests {
 
         let (cm_sender, _cm_receiver) = unbounded();
         let (_downstream_sender, cm_receiver) = unbounded();
+        let (ehash_sender, _ehash_receiver) = unbounded();
         let addr = "127.0.0.1:3333".parse().unwrap();
 
-        let server = Sv1Server::new(addr, cm_receiver, cm_sender, config);
+        let server = Sv1Server::new(addr, cm_receiver, cm_sender, ehash_sender, config);
 
         assert!(!server.config.aggregate_channels);
         assert!(!server.config.downstream_difficulty_config.enable_vardiff);
@@ -1136,9 +1212,10 @@ mod tests {
 
         let (cm_sender, _cm_receiver) = unbounded();
         let (_downstream_sender, cm_receiver) = unbounded();
+        let (ehash_sender, _ehash_receiver) = unbounded();
         let addr = "127.0.0.1:3333".parse().unwrap();
 
-        let server = Sv1Server::new(addr, cm_receiver, cm_sender, config);
+        let server = Sv1Server::new(addr, cm_receiver, cm_sender, ehash_sender, config);
         let target: Target = hash_rate_to_target(200.0, 5.0).unwrap();
 
         let set_target = SetTarget {
@@ -1158,9 +1235,10 @@ mod tests {
 
         let (cm_sender, _cm_receiver) = unbounded();
         let (_downstream_sender, cm_receiver) = unbounded();
+        let (ehash_sender, _ehash_receiver) = unbounded();
         let addr = "127.0.0.1:3333".parse().unwrap();
 
-        let server = Sv1Server::new(addr, cm_receiver, cm_sender, config);
+        let server = Sv1Server::new(addr, cm_receiver, cm_sender, ehash_sender, config);
         let target: Target = hash_rate_to_target(200.0, 5.0).unwrap();
 
         let set_target = SetTarget {

@@ -11,7 +11,8 @@
 //! # Message Format
 //! - ShareReport (0x00): Regular share (73 bytes)
 //! - BlockFoundReport (0x01): Share that found a block (73 bytes)
-//! - Both contain: pubkey(33) + share_hash(32) + difficulty_ratio(8)
+//! - RegisterChannelPubkey (0x02): Register hpub for a channel (37 bytes)
+//! - Share reports contain: pubkey(33) + share_hash(32) + difficulty_ratio(8)
 //!
 //! # Structured Logging
 //! Key events are logged as JSON for easy parsing in integration tests:
@@ -21,6 +22,7 @@
 //! - `ehash.connection.established` - Noise connection succeeded
 //! - `ehash.connection.failed` - Connection attempt failed
 //! - `ehash.fallback.written` - Report written to fallback file
+//! - `ehash.pubkey.registered` - RegisterChannelPubkey processed
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -156,6 +158,77 @@ pub struct ShareReportData {
     pub difficulty_ratio: f64,
     /// Whether this share found a block
     pub block_found: bool,
+}
+
+/// Share data pending hpub registration.
+///
+/// When a share arrives for a channel that doesn't have a registered hpub yet,
+/// we buffer the share data here until `RegisterChannelPubkey` arrives.
+#[derive(Debug, Clone)]
+pub struct PendingShareData {
+    /// Unique share identifier (32 bytes) - the SHA256d hash from share validation
+    pub share_hash: [u8; 32],
+    /// Pre-computed difficulty ratio: channel_difficulty / network_difficulty
+    pub difficulty_ratio: f64,
+    /// Whether this share found a block
+    pub block_found: bool,
+}
+
+impl PendingShareData {
+    /// Convert to ShareReportData with the given pubkey.
+    pub fn to_report(&self, pubkey: &EhashPubkey) -> ShareReportData {
+        let mut pubkey_bytes = [0u8; 33];
+        pubkey_bytes.copy_from_slice(pubkey.as_bytes());
+        ShareReportData {
+            pubkey: pubkey_bytes,
+            share_hash: self.share_hash,
+            difficulty_ratio: self.difficulty_ratio,
+            block_found: self.block_found,
+        }
+    }
+}
+
+/// Buffered shares for a channel awaiting hpub registration.
+#[derive(Debug)]
+pub struct PendingChannelShares {
+    /// Buffered shares
+    pub shares: Vec<PendingShareData>,
+    /// Deadline for receiving RegisterChannelPubkey (after this, disconnect)
+    pub deadline: Instant,
+}
+
+impl PendingChannelShares {
+    /// Create a new pending channel shares buffer with the given timeout.
+    pub fn new(timeout_secs: u64) -> Self {
+        Self {
+            shares: Vec::new(),
+            deadline: Instant::now() + Duration::from_secs(timeout_secs),
+        }
+    }
+
+    /// Check if the deadline has passed.
+    pub fn is_expired(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
+    /// Add a share to the buffer.
+    pub fn push(&mut self, share: PendingShareData) {
+        self.shares.push(share);
+    }
+}
+
+/// Data for a RegisterChannelPubkey message received from downstream.
+///
+/// This is sent from the downstream handler to the channel manager when
+/// a translator sends a RegisterChannelPubkey message after mining.authorize.
+#[derive(Debug, Clone)]
+pub struct RegisterChannelPubkeyData {
+    /// The downstream connection ID
+    pub downstream_id: usize,
+    /// The channel ID to associate with this pubkey
+    pub channel_id: u32,
+    /// The miner's ehash pubkey (33 bytes compressed)
+    pub pubkey: EhashPubkey,
 }
 
 /// A sender for share reports that can be either active (sends to mint) or inactive (no-op).

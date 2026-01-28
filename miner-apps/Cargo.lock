@@ -2894,6 +2894,7 @@ dependencies = [
  "clap",
  "config",
  "ehash-core",
+ "ehash-sv2",
  "hex",
  "hotpath",
  "serde",

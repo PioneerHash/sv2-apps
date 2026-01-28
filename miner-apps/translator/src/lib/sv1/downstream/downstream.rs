@@ -1,4 +1,4 @@
-use super::DownstreamMessages;
+use super::{DownstreamMessages, RegisterChannelPubkeyRequest};
 use crate::{
     error::{self, TproxyError, TproxyErrorKind, TproxyResult},
     status::{handle_error, StatusSender},
@@ -496,12 +496,13 @@ impl Downstream {
     /// Handles SV1 handshake completion after mining.authorize.
     ///
     /// This method is called when the downstream completes the SV1 handshake
-    /// (subscribe + authorize). It sends any cached messages in the correct order:
-    /// set_difficulty first, then notify.
+    /// (subscribe + authorize). It:
+    /// 1. Sends RegisterChannelPubkey to JDC to associate the hpub with the channel
+    /// 2. Sends any cached messages in the correct order: set_difficulty first, then notify
     async fn handle_sv1_handshake_completion(
         self: &Arc<Self>,
     ) -> TproxyResult<(), error::Downstream> {
-        let (cached_set_difficulty, cached_notify, downstream_id) =
+        let (cached_set_difficulty, cached_notify, downstream_id, channel_id, user_identity) =
             self.downstream_data.super_safe_lock(|d| {
                 d.sv1_handshake_complete
                     .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -509,9 +510,41 @@ impl Downstream {
                     d.cached_set_difficulty.take(),
                     d.cached_notify.take(),
                     d.downstream_id,
+                    d.channel_id,
+                    d.user_identity.clone(),
                 )
             });
         debug!("Down: SV1 handshake completed for downstream");
+
+        // Send RegisterChannelPubkey to JDC if we have both channel_id and hpub
+        if let Some(channel_id) = channel_id {
+            if let Some(pubkey) = ehash_core::parse_hpub_from_username(&user_identity) {
+                info!(
+                    "Down: Sending RegisterChannelPubkey for channel_id={}, pubkey={}",
+                    channel_id,
+                    pubkey.to_bech32()
+                );
+                let request = RegisterChannelPubkeyRequest { channel_id, pubkey };
+                self.downstream_channel_state
+                    .sv1_server_sender
+                    .send(DownstreamMessages::RegisterChannelPubkey(request))
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "Down: Failed to send RegisterChannelPubkey to SV1 server: {:?}",
+                            e
+                        );
+                        TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
+                    })?;
+            } else {
+                warn!(
+                    "Down: No hpub found in user_identity '{}', skipping RegisterChannelPubkey",
+                    user_identity
+                );
+            }
+        } else {
+            warn!("Down: channel_id is None at handshake completion, cannot send RegisterChannelPubkey");
+        }
 
         // Send cached messages in correct order: set_difficulty first, then notify
         if let Some(set_difficulty_msg) = cached_set_difficulty {

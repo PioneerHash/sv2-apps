@@ -102,7 +102,7 @@ impl TranslatorConfig {
             downstream_extranonce2_size,
             user_identity,
             downstream_difficulty_config,
-            aggregate_channels: false,
+            aggregate_channels,
             supported_extensions,
             required_extensions,
             log_file: None,

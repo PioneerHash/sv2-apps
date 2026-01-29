@@ -1,6 +1,5 @@
 use std::sync::atomic::Ordering;
 
-use ehash_core::parse_hpub_from_username;
 use stratum_apps::{
     stratum_core::{
         binary_sv2::Str0255,
@@ -241,29 +240,9 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
 
-        // Parse hpub from user_identity if present
-        // Expected format: "hpub1..." or "hpub1....worker_suffix"
-        // Note: We allow channels without hpub - they just won't receive ehash tokens
-        // The hpub can be updated later via TLV on share submissions
-        let ehash_pubkey = match parse_hpub_from_username(&user_identity) {
-            Some(pubkey) => {
-                info!(
-                    downstream_id,
-                    "Valid hpub found in OpenStandardMiningChannel: {}",
-                    pubkey.to_bech32()
-                );
-                Some(pubkey)
-            }
-            None => {
-                warn!(
-                    downstream_id,
-                    "No hpub in user_identity: '{}'. ehash tokens will not be issued for this channel \
-                     unless hpub is provided via TLV on share submissions.",
-                    user_identity
-                );
-                None
-            }
-        };
+        // Note: ehash pubkey is NOT parsed from user_identity here.
+        // It will be provided via RegisterChannelPubkey message from the translator
+        // after mining.authorize completes.
 
         let coinbase_outputs = self
             .channel_manager_data
@@ -515,14 +494,8 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             group_channel.add_standard_channel_id(standard_channel_id);
                         }
 
-                        // Store ehash pubkey for this channel (for share reporting to ehash-mint)
-                        if let Some(pubkey) = ehash_pubkey.as_ref() {
-                            channel_manager_data.ehash_pubkey_store.insert(
-                                downstream_id,
-                                standard_channel_id,
-                                pubkey.clone(),
-                            );
-                        }
+                        // Note: ehash pubkey will be stored when RegisterChannelPubkey
+                        // message is received from the translator.
 
                         Ok(messages)
                     })
@@ -563,29 +536,9 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         info!(downstream_id, "Received: {}", msg);
         let request_id = msg.get_request_id_as_u32();
 
-        // Parse hpub from user_identity if present
-        // Expected format: "hpub1..." or "hpub1....worker_suffix"
-        // Note: We allow channels without hpub - they just won't receive ehash tokens
-        // The hpub can be updated later via TLV on share submissions
-        let ehash_pubkey = match parse_hpub_from_username(&user_identity) {
-            Some(pubkey) => {
-                info!(
-                    downstream_id,
-                    "Valid hpub found in OpenExtendedMiningChannel: {}",
-                    pubkey.to_bech32()
-                );
-                Some(pubkey)
-            }
-            None => {
-                warn!(
-                    downstream_id,
-                    "No hpub in user_identity: '{}'. ehash tokens will not be issued for this channel \
-                     unless hpub is provided via TLV on share submissions.",
-                    user_identity
-                );
-                None
-            }
-        };
+        // Note: ehash pubkey is NOT parsed from user_identity here.
+        // It will be provided via RegisterChannelPubkey message from the translator
+        // after mining.authorize completes.
 
         let nominal_hash_rate = msg.nominal_hash_rate;
         let requested_max_target =
@@ -752,14 +705,8 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         channel_manager_data.downstream_channel_id_and_job_id_to_template_id.insert((downstream_id, extended_channel_id, future_extended_job_id).into(), last_future_template.template_id);
                         channel_manager_data.vardiff.insert((downstream_id, extended_channel_id).into(), vardiff);
 
-                        // Store ehash pubkey for this channel (for share reporting to ehash-mint)
-                        if let Some(pubkey) = ehash_pubkey.as_ref() {
-                            channel_manager_data.ehash_pubkey_store.insert(
-                                downstream_id,
-                                extended_channel_id,
-                                pubkey.clone(),
-                            );
-                        }
+                        // Note: ehash pubkey will be stored when RegisterChannelPubkey
+                        // message is received from the translator.
 
                         Ok(messages)
                     })

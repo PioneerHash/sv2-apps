@@ -12,6 +12,61 @@ use stratum_apps::{
     utils::types::{SharesBatchSize, SharesPerMinute},
 };
 
+/// ehash-mint connection configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct EhashMintConfig {
+    /// Whether ehash-mint integration is enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// Address of the ehash-mint Sv2 listener
+    pub address: Option<String>,
+    /// Port of the ehash-mint Sv2 listener
+    pub port: Option<u16>,
+    /// Authority public key of the ehash-mint (for Noise authentication)
+    pub authority_pubkey: Option<Secp256k1PublicKey>,
+    /// Optional path to fallback log file when connection is down and buffer is full.
+    /// Defaults to /tmp/ehash-reports-fallback.log
+    pub fallback_log_path: Option<PathBuf>,
+    /// Timeout in seconds for receiving RegisterChannelPubkey after channel open.
+    /// If exceeded, the downstream is disconnected. Defaults to 5 seconds.
+    #[serde(default)]
+    pub pubkey_timeout_secs: Option<u64>,
+}
+
+impl Default for EhashMintConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            address: None,
+            port: None,
+            authority_pubkey: None,
+            fallback_log_path: None,
+            pubkey_timeout_secs: Some(5),
+        }
+    }
+}
+
+impl EhashMintConfig {
+    /// Returns the socket address for the ehash-mint if configured.
+    pub fn socket_addr(&self) -> Option<SocketAddr> {
+        match (self.enabled, &self.address, self.port) {
+            (true, Some(addr), Some(port)) => {
+                let addr_str = format!("{}:{}", addr, port);
+                addr_str.parse().ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Check if ehash-mint integration is properly configured.
+    pub fn is_configured(&self) -> bool {
+        self.enabled
+            && self.address.is_some()
+            && self.port.is_some()
+            && self.authority_pubkey.is_some()
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct JobDeclaratorClientConfig {
     // The address on which the JDC will listen for incoming connections when acting as an
@@ -59,6 +114,9 @@ pub struct JobDeclaratorClientConfig {
     monitoring_address: Option<SocketAddr>,
     #[serde(default = "default_monitoring_cache_refresh_secs")]
     monitoring_cache_refresh_secs: u64,
+    /// ehash-mint configuration for ecash integration
+    #[serde(default)]
+    ehash_mint: EhashMintConfig,
 }
 
 fn default_monitoring_cache_refresh_secs() -> u64 {
@@ -104,6 +162,7 @@ impl JobDeclaratorClientConfig {
             required_extensions,
             monitoring_address: None,
             monitoring_cache_refresh_secs: 15,
+            ehash_mint: EhashMintConfig::default(),
         }
     }
 
@@ -115,6 +174,16 @@ impl JobDeclaratorClientConfig {
     /// Returns the monitoring cache refresh interval in seconds.
     pub fn monitoring_cache_refresh_secs(&self) -> u64 {
         self.monitoring_cache_refresh_secs
+    }
+
+    /// Returns the ehash-mint configuration.
+    pub fn ehash_mint(&self) -> &EhashMintConfig {
+        &self.ehash_mint
+    }
+
+    /// Returns the timeout in seconds for receiving RegisterChannelPubkey.
+    pub fn ehash_pubkey_timeout_secs(&self) -> Option<u64> {
+        self.ehash_mint.pubkey_timeout_secs
     }
 
     /// Returns the listening address of the Job Declarator Client.

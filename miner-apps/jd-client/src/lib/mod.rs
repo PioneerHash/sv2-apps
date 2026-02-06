@@ -37,6 +37,7 @@ use crate::{
 mod channel_manager;
 pub mod config;
 mod downstream;
+pub mod ehash_mint;
 pub mod error;
 mod io_task;
 pub mod jd_mode;
@@ -106,6 +107,37 @@ impl JobDeclaratorClient {
 
         debug!("Channels initialized.");
 
+        // Initialize ehash-mint client if configured (before ChannelManager so we can pass the sender)
+        let ehash_report_sender = if let Some((ehash_client, ehash_receiver)) =
+            ehash_mint::EhashMintClient::new(self.config.ehash_mint())
+        {
+            info!("ehash-mint integration enabled");
+
+            let sender = ehash_client.report_sender();
+
+            // Start the mint communication task using cancellation token
+            let cancellation_token_ehash = self.cancellation_token.clone();
+            let fallback_token_ehash = fallback_coordinator.token();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+            task_manager.spawn(async move {
+                tokio::select! {
+                    _ = cancellation_token_ehash.cancelled() => {}
+                    _ = fallback_token_ehash.cancelled() => {}
+                }
+                let _ = shutdown_tx.send(());
+            });
+
+            ehash_mint::start_mint_task(
+                self.config.ehash_mint().clone(),
+                ehash_receiver,
+                shutdown_rx,
+            );
+
+            sender
+        } else {
+            ehash_mint::ShareReportSender::Inactive
+        };
+
         let mut channel_manager = ChannelManager::new(
             self.config.clone(),
             channel_manager_to_upstream_sender.clone(),
@@ -119,6 +151,7 @@ impl JobDeclaratorClient {
             encoded_outputs.clone(),
             self.config.supported_extensions().to_vec(),
             self.config.required_extensions().to_vec(),
+            ehash_report_sender.clone(),
         )
         .await
         .unwrap();
@@ -417,6 +450,7 @@ impl JobDeclaratorClient {
                                     encoded_outputs.clone(),
                                     self.config.supported_extensions().to_vec(),
                                     self.config.required_extensions().to_vec(),
+                                    ehash_report_sender.clone(),
                                 )
                                 .await
                                 .unwrap();

@@ -3,7 +3,7 @@ use stratum_apps::stratum_core::parsers_sv2::{Mining, Tlv};
 
 use stratum_apps::{
     stratum_core::sv1_api::json_rpc,
-    utils::types::{ChannelId, DownstreamId},
+    utils::types::{ChannelId, DownstreamId, Sv2Frame},
 };
 use tokio::sync::broadcast;
 
@@ -15,6 +15,9 @@ pub struct Sv1ServerChannelState {
     pub downstream_to_sv1_server_receiver: Receiver<(DownstreamId, json_rpc::Message)>,
     pub channel_manager_receiver: Receiver<(Mining<'static>, Option<Vec<Tlv>>)>,
     pub channel_manager_sender: Sender<(Mining<'static>, Option<Vec<Tlv>>)>,
+    /// Sender for ehash extension messages (RegisterChannelPubkey) directly to upstream.
+    /// This bypasses the channel manager for ehash-specific messages.
+    pub ehash_upstream_sender: Sender<Sv2Frame>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -22,6 +25,7 @@ impl Sv1ServerChannelState {
     pub fn new(
         channel_manager_receiver: Receiver<(Mining<'static>, Option<Vec<Tlv>>)>,
         channel_manager_sender: Sender<(Mining<'static>, Option<Vec<Tlv>>)>,
+        ehash_upstream_sender: Sender<Sv2Frame>,
     ) -> Self {
         let (sv1_server_to_downstream_sender, _) = broadcast::channel(1000);
         let (downstream_to_sv1_server_sender, downstream_to_sv1_server_receiver) = unbounded();
@@ -32,6 +36,7 @@ impl Sv1ServerChannelState {
             downstream_to_sv1_server_sender,
             channel_manager_receiver,
             channel_manager_sender,
+            ehash_upstream_sender,
         }
     }
 

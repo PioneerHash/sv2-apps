@@ -1,12 +1,12 @@
+use ehash_core::parse_hpub_from_username;
 use stratum_apps::stratum_core::sv1_api::{
     client_to_server, json_rpc, server_to_client,
     utils::{Extranonce, HexU32Be},
     IsServer,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
-    error,
     sv1::{downstream::SubmitShareWithChannelId, Sv1Server},
     utils::validate_sv1_share,
 };
@@ -88,7 +88,29 @@ impl IsServer<'static> for Sv1Server {
         let downstream_id = client_id.expect("Downstream id should exist");
         info!("Received mining.authorize from Sv1 downstream {downstream_id}");
         debug!("Down: Handling mining.authorize: {:?}", request);
-        true
+
+        // Validate that the username contains a valid hpub before the period
+        // Expected format: "hpub1..." or "hpub1....worker_suffix"
+        let username = &request.name;
+        match parse_hpub_from_username(username) {
+            Some(pubkey) => {
+                info!(
+                    "Down: Valid hpub found in authorize request: {}",
+                    pubkey.to_bech32()
+                );
+                true
+            }
+            None => {
+                warn!(
+                    "Down: Invalid or missing hpub in authorize request. Username: '{}'. \
+                     Expected format: 'hpub1<bech32_data>' or 'hpub1<bech32_data>.worker_suffix'",
+                    username
+                );
+                // For now, still allow - log warning but don't reject
+                // This allows non-ehash miners to connect
+                true
+            }
+        }
     }
 
     fn handle_submit(

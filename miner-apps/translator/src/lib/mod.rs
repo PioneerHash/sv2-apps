@@ -109,6 +109,7 @@ impl TranslatorSv2 {
             downstream_addr,
             channel_manager_to_sv1_server_receiver,
             sv1_server_to_channel_manager_sender,
+            channel_manager_to_upstream_sender.clone(),
             self.config.clone(),
         );
 

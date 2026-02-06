@@ -19,8 +19,14 @@ path = "src/lib/mod.rs"
 name = "translator_sv2"
 path = "src/main.rs"
 
+[[bin]]
+name = "ehash-translator"
+path = "src/main.rs"
+
 [dependencies]
 stratum-apps = { path = "../../stratum-apps", features = ["translator"] }
+ehash-core = { path = "../../../../crates/ehash-core" }
+ehash-sv2 = { path = "../../../../crates/ehash-sv2" }
 async-channel = "1.5.1"
 serde = { version = "1.0.89", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1.0.64", default-features = false, features = ["alloc"] }

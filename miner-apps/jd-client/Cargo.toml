@@ -15,6 +15,14 @@ keywords = ["stratum", "mining", "bitcoin", "protocol"]
 name = "jd_client_sv2"
 path = "src/lib/mod.rs"
 
+[[bin]]
+name = "ehash-jdc"
+path = "src/main.rs"
+
+[[bin]]
+name = "jd_client_sv2"
+path = "src/main.rs"
+
 [dependencies]
 stratum-apps = { path = "../../stratum-apps", features = ["jd_client"] }
 async-channel = "1.5.1"
@@ -26,6 +34,9 @@ clap = { version = "4.5.39", features = ["derive"] }
 bitcoin_core_sv2 = { path = "../../bitcoin-core-sv2" }
 hex = "0.4.3"
 hotpath = "0.9"
+ehash-core = { path = "../../../../crates/ehash-core" }
+ehash-sv2 = { path = "../../../../crates/ehash-sv2" }
+serde_json = "1.0"
 
 [features]
 hotpath = ["hotpath/hotpath"]

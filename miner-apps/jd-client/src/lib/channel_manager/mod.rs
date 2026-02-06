@@ -61,6 +61,9 @@ use crate::{
     channel_manager::downstream_message_handler::RouteMessageTo,
     config::JobDeclaratorClientConfig,
     downstream::Downstream,
+    ehash_mint::{
+        EhashPubkeyStore, PendingChannelShares, RegisterChannelPubkeyData, ShareReportSender,
+    },
     error::{self, JDCError, JDCErrorKind, JDCResult},
     status::{handle_error, Status, StatusSender},
     utils::{
@@ -159,6 +162,19 @@ pub struct ChannelManagerData {
     supported_extensions: Vec<u16>,
     /// Extensions that the JDC requires
     required_extensions: Vec<u16>,
+    /// Stores the mapping of (downstream_id, channel_id) → EhashPubkey for ehash minting
+    pub ehash_pubkey_store: EhashPubkeyStore,
+    /// Sender for share reports to ehash-mint (no-op if ehash-mint not configured)
+    pub ehash_report_sender: ShareReportSender,
+    /// Buffered shares for channels awaiting hpub registration via RegisterChannelPubkey.
+    /// Key is (downstream_id, channel_id).
+    pub pending_ehash_shares: HashMap<(usize, u32), PendingChannelShares>,
+    /// Timeout in seconds for receiving RegisterChannelPubkey after channel open.
+    /// If exceeded, the downstream is disconnected.
+    pub ehash_pubkey_timeout_secs: u64,
+    /// Current estimated block height (incremented on each SetNewPrevHash).
+    /// This is an estimate - the actual height is not included in Sv2 messages.
+    pub estimated_block_height: u64,
 }
 
 impl ChannelManagerData {
@@ -197,6 +213,13 @@ impl ChannelManagerData {
         self.pool_tag_string = None;
 
         self.coinbase_outputs = coinbase_outputs;
+
+        // Clear ehash pubkey store on reset (channels are being reset)
+        self.ehash_pubkey_store = EhashPubkeyStore::new();
+        // Clear pending ehash shares on reset
+        self.pending_ehash_shares.clear();
+        // Note: ehash_report_sender is preserved - connection to mint stays open
+        // Note: ehash_pubkey_timeout_secs is preserved - it's configuration
     }
 }
 
@@ -236,6 +259,10 @@ pub struct ChannelManagerChannel {
     tp_receiver: Receiver<TemplateDistribution<'static>>,
     downstream_sender: broadcast::Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
     downstream_receiver: Receiver<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
+    /// Sender for ehash extension messages to downstreams (cloned per downstream).
+    ehash_sender: Sender<RegisterChannelPubkeyData>,
+    /// Receiver for ehash extension messages from downstreams.
+    ehash_receiver: Receiver<RegisterChannelPubkeyData>,
 }
 
 /// Contains all the state of mutable and immutable data required
@@ -274,6 +301,7 @@ impl ChannelManager {
         coinbase_outputs: Vec<u8>,
         supported_extensions: Vec<u16>,
         required_extensions: Vec<u16>,
+        ehash_report_sender: ShareReportSender,
     ) -> JDCResult<Self, error::ChannelManager> {
         let (range_0, range_1, range_2) = {
             let range_1 = 0..JDC_SEARCH_SPACE_BYTES;
@@ -315,7 +343,15 @@ impl ChannelManager {
             negotiated_extensions: vec![],
             supported_extensions,
             required_extensions,
+            ehash_pubkey_store: EhashPubkeyStore::new(),
+            ehash_report_sender,
+            pending_ehash_shares: HashMap::new(),
+            ehash_pubkey_timeout_secs: config.ehash_pubkey_timeout_secs().unwrap_or(5),
+            estimated_block_height: 0,
         }));
+
+        // Create ehash channel for RegisterChannelPubkey messages from downstreams
+        let (ehash_sender, ehash_receiver) = async_channel::unbounded();
 
         let channel_manager_channel = ChannelManagerChannel {
             upstream_sender,
@@ -326,6 +362,8 @@ impl ChannelManager {
             tp_receiver,
             downstream_sender,
             downstream_receiver,
+            ehash_sender,
+            ehash_receiver,
         };
 
         let channel_manager = ChannelManager {
@@ -548,6 +586,7 @@ impl ChannelManager {
                                     group_channel,
                                     channel_manager_sender.clone(),
                                     channel_manager_receiver.clone(),
+                                    self.channel_manager_channel.ehash_sender.clone(),
                                     noise_stream,
                                     notify_shutdown.clone(),
                                     task_manager_clone.clone(),
@@ -679,9 +718,62 @@ impl ChannelManager {
                             }
                         }
                     }
+                    res = self.handle_ehash_message() => {
+                        if let Err(e) = res {
+                            error!(error = ?e, "Error handling ehash message");
+                            if handle_error(&status_sender, e).await {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         });
+    }
+
+    /// Handle RegisterChannelPubkey messages from downstreams.
+    ///
+    /// When a downstream (translator) sends a RegisterChannelPubkey message after
+    /// receiving mining.authorize, this handler:
+    /// 1. Stores the pubkey in ehash_pubkey_store
+    /// 2. Processes any buffered shares for that channel
+    async fn handle_ehash_message(&mut self) -> JDCResult<(), error::ChannelManager> {
+        if let Ok(data) = self.channel_manager_channel.ehash_receiver.recv().await {
+            info!(
+                downstream_id = data.downstream_id,
+                channel_id = data.channel_id,
+                pubkey = %data.pubkey.to_bech32(),
+                "Processing RegisterChannelPubkey"
+            );
+
+            self.channel_manager_data.super_safe_lock(|cm_data| {
+                // Store the pubkey
+                cm_data.ehash_pubkey_store.insert(
+                    data.downstream_id,
+                    data.channel_id,
+                    data.pubkey.clone(),
+                );
+
+                // Check for buffered shares
+                let key = (data.downstream_id, data.channel_id);
+                if let Some(pending) = cm_data.pending_ehash_shares.remove(&key) {
+                    let share_count = pending.shares.len();
+                    info!(
+                        downstream_id = data.downstream_id,
+                        channel_id = data.channel_id,
+                        share_count,
+                        "Processing buffered shares after RegisterChannelPubkey"
+                    );
+
+                    // Send all buffered shares to ehash-mint
+                    for share in pending.shares {
+                        let report = share.to_report(&data.pubkey);
+                        cm_data.ehash_report_sender.try_send_share(report);
+                    }
+                }
+            });
+        }
+        Ok(())
     }
 
     // Removes a downstream entry from the Channel Manager’s state.
@@ -701,6 +793,8 @@ impl ChannelManager {
             cm_data
                 .vardiff
                 .retain(|key, _| key.downstream_id != downstream_id);
+            // Clean up ehash pubkey store entries for this downstream
+            cm_data.ehash_pubkey_store.remove_downstream(downstream_id);
         });
         Ok(())
     }

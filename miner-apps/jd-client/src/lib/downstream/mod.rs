@@ -26,6 +26,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, warn};
 
 use crate::{
+    ehash_mint::RegisterChannelPubkeyData,
     error::{self, JDCError, JDCErrorKind, JDCResult},
     io_task::spawn_io_tasks,
     status::{handle_error, Status, StatusSender},
@@ -74,6 +75,8 @@ pub struct DownstreamChannel {
     channel_manager_receiver: broadcast::Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
     downstream_sender: Sender<Sv2Frame>,
     downstream_receiver: Receiver<Sv2Frame>,
+    /// Sender for ehash extension messages (RegisterChannelPubkey) to channel manager.
+    ehash_sender: Sender<RegisterChannelPubkeyData>,
 }
 
 /// Represents a downstream client connected to this node.
@@ -98,6 +101,7 @@ impl Downstream {
             Mining<'static>,
             Option<Vec<Tlv>>,
         )>,
+        ehash_sender: Sender<RegisterChannelPubkeyData>,
         noise_stream: NoiseTcpStream<Message>,
         notify_shutdown: broadcast::Sender<ShutdownMessage>,
         task_manager: Arc<TaskManager>,
@@ -127,6 +131,7 @@ impl Downstream {
             channel_manager_sender,
             downstream_sender: outbound_tx,
             downstream_receiver: inbound_rx,
+            ehash_sender,
         };
 
         let downstream_data = Arc::new(Mutex::new(DownstreamData {
@@ -299,6 +304,14 @@ impl Downstream {
             .get_header()
             .expect("frame header must be present");
         let payload = sv2_frame.payload();
+
+        // Check for ehash extension messages before standard parsing
+        // ehash messages have extension_type = 0x0100 (EHASH_EXTENSION_TYPE)
+        let extension_type = header.ext_type_without_channel_msg();
+        if extension_type == ehash_sv2::EHASH_EXTENSION_TYPE {
+            return self.handle_ehash_message(header, payload).await;
+        }
+
         let negotiated_extensions = self
             .downstream_data
             .super_safe_lock(|data| data.negotiated_extensions.clone());
@@ -328,6 +341,89 @@ impl Downstream {
                 return Ok(());
             }
         }
+        Ok(())
+    }
+
+    /// Handle ehash extension messages (extension_type = 0x0100).
+    ///
+    /// Currently handles:
+    /// - RegisterChannelPubkey (0x02): Register hpub for a channel after mining.authorize
+    async fn handle_ehash_message(
+        &mut self,
+        header: stratum_apps::stratum_core::framing_sv2::header::Header,
+        payload: &mut [u8],
+    ) -> JDCResult<(), error::Downstream> {
+        use ehash_sv2::{EhashMessage, MSG_TYPE_REGISTER_CHANNEL_PUBKEY};
+
+        let msg_type = header.msg_type();
+
+        match msg_type {
+            MSG_TYPE_REGISTER_CHANNEL_PUBKEY => {
+                // Parse RegisterChannelPubkey message
+                let ehash_msg: EhashMessage = (header, payload).try_into().map_err(|e| {
+                    error!(?e, "Failed to parse RegisterChannelPubkey message");
+                    JDCError::disconnect(
+                        JDCErrorKind::UnexpectedMessage(ehash_sv2::EHASH_EXTENSION_TYPE, msg_type),
+                        self.downstream_id,
+                    )
+                })?;
+
+                if let EhashMessage::RegisterChannelPubkey(register_msg) = ehash_msg {
+                    debug!(
+                        downstream_id = self.downstream_id,
+                        channel_id = register_msg.channel_id,
+                        pubkey = %register_msg.pubkey_hex(),
+                        "Received RegisterChannelPubkey"
+                    );
+
+                    // Convert to EhashPubkey
+                    let pubkey = ehash_core::EhashPubkey::from_bytes(register_msg.pubkey_bytes())
+                        .map_err(|e| {
+                        error!(?e, "Invalid pubkey in RegisterChannelPubkey");
+                        JDCError::disconnect(
+                            JDCErrorKind::UnexpectedMessage(
+                                ehash_sv2::EHASH_EXTENSION_TYPE,
+                                msg_type,
+                            ),
+                            self.downstream_id,
+                        )
+                    })?;
+
+                    // Send to channel manager via the ehash channel
+                    let data = crate::ehash_mint::RegisterChannelPubkeyData {
+                        downstream_id: self.downstream_id,
+                        channel_id: register_msg.channel_id,
+                        pubkey,
+                    };
+
+                    self.downstream_channel
+                        .ehash_sender
+                        .send(data)
+                        .await
+                        .map_err(|e| {
+                            error!(
+                                ?e,
+                                "Failed to send RegisterChannelPubkey to channel manager"
+                            );
+                            JDCError::shutdown(JDCErrorKind::ChannelErrorSender)
+                        })?;
+                } else {
+                    error!("Expected RegisterChannelPubkey but got different ehash message");
+                    return Err(JDCError::disconnect(
+                        JDCErrorKind::UnexpectedMessage(ehash_sv2::EHASH_EXTENSION_TYPE, msg_type),
+                        self.downstream_id,
+                    ));
+                }
+            }
+            _ => {
+                warn!(
+                    downstream_id = self.downstream_id,
+                    msg_type, "Received unknown ehash message type"
+                );
+                // Don't disconnect for unknown messages - just ignore them
+            }
+        }
+
         Ok(())
     }
 }

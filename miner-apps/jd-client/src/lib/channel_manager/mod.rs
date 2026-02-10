@@ -2,9 +2,10 @@ use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_channel::{Receiver, Sender};
@@ -282,6 +283,12 @@ pub struct ChannelManager {
     /// 3. Connected: An upstream channel is successfully established.
     /// 4. SoloMining: No upstream is available; the JDC operates in solo mining mode. case.
     pub upstream_state: AtomicUpstreamState,
+    /// Whether developer mode is enabled (skips share PoW validation).
+    developer_mode: bool,
+    /// Last time a developer mode warning was logged (Unix timestamp in seconds).
+    developer_mode_last_warning: Arc<AtomicU64>,
+    /// Interval in minutes between developer mode warnings.
+    developer_mode_warning_interval_mins: u64,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -366,6 +373,17 @@ impl ChannelManager {
             ehash_receiver,
         };
 
+        let developer_mode = config.is_developer_mode();
+        let developer_mode_warning_interval_mins = config.developer_mode_warning_interval_mins();
+
+        // Log startup warning if developer mode is enabled
+        if developer_mode {
+            warn!(
+                "DEVELOPER MODE ENABLED - Share PoW validation is DISABLED. \
+                 This is UNSAFE for production use. Shares will be accepted without proof-of-work verification."
+            );
+        }
+
         let channel_manager = ChannelManager {
             channel_manager_data,
             channel_manager_channel,
@@ -374,9 +392,47 @@ impl ChannelManager {
             miner_tag_string: config.jdc_signature().to_string(),
             user_identity: config.user_identity().to_string(),
             upstream_state: AtomicUpstreamState::new(UpstreamState::SoloMining),
+            developer_mode,
+            developer_mode_last_warning: Arc::new(AtomicU64::new(0)),
+            developer_mode_warning_interval_mins,
         };
 
         Ok(channel_manager)
+    }
+
+    /// Logs a periodic warning when developer mode is active.
+    /// This method rate-limits warnings to once per configured interval.
+    pub fn log_developer_mode_warning(&self) {
+        if !self.developer_mode {
+            return;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let last_warning = self.developer_mode_last_warning.load(Ordering::Relaxed);
+        let interval_secs = self.developer_mode_warning_interval_mins * 60;
+
+        if now >= last_warning + interval_secs {
+            if self
+                .developer_mode_last_warning
+                .compare_exchange(last_warning, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                warn!(
+                    "DEVELOPER MODE ACTIVE - Share PoW validation is DISABLED. \
+                     This warning repeats every {} minutes.",
+                    self.developer_mode_warning_interval_mins
+                );
+            }
+        }
+    }
+
+    /// Returns whether developer mode is enabled.
+    pub fn is_developer_mode(&self) -> bool {
+        self.developer_mode
     }
 
     // Bootstraps a group channel with the given parameters.

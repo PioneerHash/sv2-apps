@@ -31,3 +31,4 @@ hotpath = "0.9"
 [features]
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+developer_mode = []

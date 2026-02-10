@@ -40,6 +40,31 @@ pub struct PoolConfig {
     required_extensions: Vec<u16>,
     #[serde(default)]
     monitoring_address: Option<SocketAddr>,
+    // Developer mode configuration (only available with `developer_mode` feature).
+    // This is intentionally not documented in example configs to discourage production use.
+    // Developers looking at this code will understand the implications.
+    //
+    // When `developer_mode` is enabled, share proof-of-work validation is skipped.
+    // This allows simulated miners (that don't produce real PoW) to submit shares
+    // for testing purposes. The Pool will accept any share with a valid job_id.
+    //
+    // WARNING: Never enable this in production - it completely disables share validation.
+    //
+    // Build with: cargo build --features developer_mode
+    // Config:
+    //   developer_mode = true
+    //   developer_mode_warning_interval_mins = 5
+    #[cfg(feature = "developer_mode")]
+    #[serde(default)]
+    developer_mode: bool,
+    #[cfg(feature = "developer_mode")]
+    #[serde(default = "default_developer_mode_warning_interval_mins")]
+    developer_mode_warning_interval_mins: u64,
+}
+
+#[cfg(feature = "developer_mode")]
+fn default_developer_mode_warning_interval_mins() -> u64 {
+    5
 }
 
 impl PoolConfig {
@@ -75,6 +100,10 @@ impl PoolConfig {
             supported_extensions,
             required_extensions,
             monitoring_address: None,
+            #[cfg(feature = "developer_mode")]
+            developer_mode: false,
+            #[cfg(feature = "developer_mode")]
+            developer_mode_warning_interval_mins: default_developer_mode_warning_interval_mins(),
         }
     }
 
@@ -164,6 +193,30 @@ impl PoolConfig {
     /// Returns the monitoring address (optional).
     pub fn monitoring_address(&self) -> Option<SocketAddr> {
         self.monitoring_address
+    }
+
+    /// Returns whether developer mode is enabled.
+    /// Always returns false when compiled without the `developer_mode` feature.
+    #[cfg(feature = "developer_mode")]
+    pub fn is_developer_mode(&self) -> bool {
+        self.developer_mode
+    }
+
+    #[cfg(not(feature = "developer_mode"))]
+    pub fn is_developer_mode(&self) -> bool {
+        false
+    }
+
+    /// Returns the developer mode warning interval in minutes.
+    /// Returns 0 when compiled without the `developer_mode` feature.
+    #[cfg(feature = "developer_mode")]
+    pub fn developer_mode_warning_interval_mins(&self) -> u64 {
+        self.developer_mode_warning_interval_mins
+    }
+
+    #[cfg(not(feature = "developer_mode"))]
+    pub fn developer_mode_warning_interval_mins(&self) -> u64 {
+        0
     }
 }
 

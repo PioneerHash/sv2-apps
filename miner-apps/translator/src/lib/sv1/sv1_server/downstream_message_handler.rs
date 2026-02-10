@@ -170,14 +170,27 @@ impl IsServer<'static> for Sv1Server {
                 channel_id
             );
 
-            let is_valid = validate_sv1_share(
-                request,
-                data.target,
-                data.extranonce1.clone().into(),
-                data.version_rolling_mask.clone(),
-                job,
-            )
-            .unwrap_or(false);
+            // Check if developer mode is enabled (skips PoW validation for testing).
+            // Developer mode is a compile-time feature that must be explicitly enabled.
+            // When enabled, shares with valid job_ids are accepted without PoW verification.
+            // This is useful for simulated miners that don't produce real proof-of-work.
+            let developer_mode = self.config.downstream_difficulty_config.is_developer_mode();
+
+            let is_valid = if developer_mode {
+                // Log periodic warning about developer mode being active
+                self.log_developer_mode_warning();
+                debug!("Developer mode: skipping PoW validation for share");
+                true
+            } else {
+                validate_sv1_share(
+                    request,
+                    data.target,
+                    data.extranonce1.clone().into(),
+                    data.version_rolling_mask.clone(),
+                    job,
+                )
+                .unwrap_or(false)
+            };
 
             if !is_valid {
                 error!("Invalid share for channel id: {}", channel_id);

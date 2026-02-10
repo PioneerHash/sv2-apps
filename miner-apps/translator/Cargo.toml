@@ -44,6 +44,7 @@ default = ["monitoring"]
 monitoring = ["stratum-apps/monitoring"]
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+developer_mode = []
 
 
 [dev-dependencies]

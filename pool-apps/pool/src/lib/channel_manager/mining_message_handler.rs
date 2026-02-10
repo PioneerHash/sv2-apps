@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 
 use stratum_apps::stratum_core::{
     binary_sv2::Str0255,
-    bitcoin::{consensus::Decodable, Amount, Target, TxOut},
+    bitcoin::{consensus::Decodable, hashes::Hash, Amount, Target, TxOut},
     channels_sv2::{
         server::{
             error::{ExtendedChannelError, StandardChannelError},
@@ -21,7 +21,7 @@ use stratum_apps::stratum_core::{
     parsers_sv2::{Mining, TemplateDistribution, Tlv, TlvField},
     template_distribution_sv2::SubmitSolution,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::{
     channel_manager::{ChannelManager, RouteMessageTo, CLIENT_SEARCH_SPACE_BYTES},
@@ -526,6 +526,13 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
 
+        // Capture developer_mode before entering the closure
+        let developer_mode = self.is_developer_mode();
+        if developer_mode {
+            self.log_developer_mode_warning();
+            debug!("Developer mode: skipping PoW validation for standard share");
+        }
+
         let messages = self.channel_manager_data.super_safe_lock(|channel_manager_data| {
             let channel_id = msg.channel_id;
 
@@ -552,7 +559,12 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     return Ok(vec![(downstream_id, Mining::CloseChannel(create_close_channel_msg(channel_id, "invalid-channel-id"))).into()]);
                 };
 
-                let res = standard_channel.validate_share(msg.clone());
+                // In developer mode, skip PoW validation and treat share as valid
+                let res = if developer_mode {
+                    Ok(ShareValidationResult::Valid(Hash::all_zeros()))
+                } else {
+                    standard_channel.validate_share(msg.clone())
+                };
                 vardiff.increment_shares_since_last_update();
 
 
@@ -688,6 +700,13 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
 
+        // Capture developer_mode before entering the closure
+        let developer_mode = self.is_developer_mode();
+        if developer_mode {
+            self.log_developer_mode_warning();
+            debug!("Developer mode: skipping PoW validation for extended share");
+        }
+
         // Extract user_identity from TLV fields if the extension is negotiated
         let negotiated_extensions = self.get_negotiated_extensions_with_client(client_id);
         let user_identity = if negotiated_extensions
@@ -735,7 +754,12 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     return Ok(vec![(downstream_id, Mining::CloseChannel(create_close_channel_msg(channel_id, "invalid-channel-id"))).into()]);
                 };
 
-                let res = extended_channel.validate_share(msg.clone());
+                // In developer mode, skip PoW validation and treat share as valid
+                let res = if developer_mode {
+                    Ok(ShareValidationResult::Valid(Hash::all_zeros()))
+                } else {
+                    extended_channel.validate_share(msg.clone())
+                };
                 vardiff.increment_shares_since_last_update();
 
                 match res {

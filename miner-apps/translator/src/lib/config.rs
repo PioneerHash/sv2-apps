@@ -143,6 +143,32 @@ pub struct DownstreamDifficultyConfig {
     /// frequently enough (e.g., due to low Bitcoin mempool activity).
     /// Set to 0 to disable keepalive jobs.
     pub job_keepalive_interval_secs: u16,
+    // Developer mode configuration (only available with `developer_mode` feature).
+    // This is intentionally not documented in example configs to discourage production use.
+    // Developers looking at this code will understand the implications.
+    //
+    // When `developer_mode` is enabled, share proof-of-work validation is skipped.
+    // This allows simulated miners (that don't produce real PoW) to submit shares
+    // for testing purposes. The translator will accept any share with a valid job_id.
+    //
+    // WARNING: Never enable this in production - it completely disables share validation.
+    //
+    // Build with: cargo build --features developer_mode
+    // Config:
+    //   [downstream_difficulty_config]
+    //   developer_mode = true
+    //   developer_mode_warning_interval_mins = 5
+    #[cfg(feature = "developer_mode")]
+    #[serde(default)]
+    pub developer_mode: bool,
+    #[cfg(feature = "developer_mode")]
+    #[serde(default = "default_developer_mode_warning_interval_mins")]
+    pub developer_mode_warning_interval_mins: u64,
+}
+
+#[cfg(feature = "developer_mode")]
+fn default_developer_mode_warning_interval_mins() -> u64 {
+    5
 }
 
 impl DownstreamDifficultyConfig {
@@ -158,7 +184,35 @@ impl DownstreamDifficultyConfig {
             shares_per_minute,
             enable_vardiff,
             job_keepalive_interval_secs,
+            #[cfg(feature = "developer_mode")]
+            developer_mode: false,
+            #[cfg(feature = "developer_mode")]
+            developer_mode_warning_interval_mins: default_developer_mode_warning_interval_mins(),
         }
+    }
+
+    /// Returns whether developer mode is enabled.
+    /// Always returns false when compiled without the `developer_mode` feature.
+    #[cfg(feature = "developer_mode")]
+    pub fn is_developer_mode(&self) -> bool {
+        self.developer_mode
+    }
+
+    #[cfg(not(feature = "developer_mode"))]
+    pub fn is_developer_mode(&self) -> bool {
+        false
+    }
+
+    /// Returns the developer mode warning interval in minutes.
+    /// Returns 0 when compiled without the `developer_mode` feature.
+    #[cfg(feature = "developer_mode")]
+    pub fn developer_mode_warning_interval_mins(&self) -> u64 {
+        self.developer_mode_warning_interval_mins
+    }
+
+    #[cfg(not(feature = "developer_mode"))]
+    pub fn developer_mode_warning_interval_mins(&self) -> u64 {
+        0
     }
 }
 

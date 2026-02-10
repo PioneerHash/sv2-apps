@@ -15,10 +15,10 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use stratum_apps::{
     custom_mutex::Mutex,
@@ -80,6 +80,9 @@ pub struct Sv1Server {
     /// Valid Sv1 jobs storage, containing only a single shared entry (AGGREGATED_CHANNEL_ID) in
     /// case of channels aggregation (aggregated mode)
     pub(crate) valid_sv1_jobs: Arc<DashMap<ChannelId, Vec<server_to_client::Notify<'static>>>>,
+    /// Tracks the last time a developer mode warning was logged (unix timestamp in seconds).
+    /// Only used when compiled with the `developer_mode` feature.
+    pub(crate) developer_mode_last_warning: Arc<AtomicU64>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -108,7 +111,7 @@ impl Sv1Server {
         let shares_per_minute = config.downstream_difficulty_config.shares_per_minute;
         let sv1_server_channel_state =
             Sv1ServerChannelState::new(channel_manager_receiver, channel_manager_sender);
-        Self {
+        let server = Self {
             sv1_server_channel_state,
             config,
             listener_addr,
@@ -124,7 +127,22 @@ impl Sv1Server {
             prevhashes: Arc::new(DashMap::new()),
             pending_target_updates: Arc::new(Mutex::new(Vec::new())),
             valid_sv1_jobs: Arc::new(DashMap::new()),
+            developer_mode_last_warning: Arc::new(AtomicU64::new(0)),
+        };
+
+        // Log startup warning if developer mode is enabled
+        if server
+            .config
+            .downstream_difficulty_config
+            .is_developer_mode()
+        {
+            warn!(
+                "DEVELOPER MODE ENABLED: Share PoW validation is disabled. \
+                 DO NOT USE IN PRODUCTION."
+            );
         }
+
+        server
     }
 
     /// Starts the SV1 server and begins accepting connections.
@@ -1123,6 +1141,36 @@ impl Sv1Server {
             .iter()
             .find(|j| j.job_id == job_id)
             .cloned()
+    }
+
+    /// Logs a developer mode warning if the configured interval has passed since the last warning.
+    /// This is called on each share submission when developer mode is enabled to ensure
+    /// operators are aware that PoW validation is disabled.
+    pub(crate) fn log_developer_mode_warning(&self) {
+        let interval_mins = self
+            .config
+            .downstream_difficulty_config
+            .developer_mode_warning_interval_mins();
+        if interval_mins == 0 {
+            return;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let last_warning = self.developer_mode_last_warning.load(Ordering::Relaxed);
+        let interval_secs = interval_mins * 60;
+
+        if now.saturating_sub(last_warning) >= interval_secs {
+            warn!(
+                "DEVELOPER MODE ACTIVE: Share PoW validation is disabled. \
+                 DO NOT USE IN PRODUCTION."
+            );
+            self.developer_mode_last_warning
+                .store(now, Ordering::Relaxed);
+        }
     }
 }
 

@@ -496,7 +496,9 @@ impl Sv1Server {
         )
         .map_err(|_| TproxyError::shutdown(TproxyErrorKind::SV1Error))?;
 
-        // Only add TLV fields with user identity in non-aggregated mode
+        // Only add TLV fields with user identity in non-aggregated mode.
+        // If the user_identity contains an hpub, extract just the worker suffix
+        // (the pubkey is already sent via RegisterChannelPubkey).
         let tlv_fields = if is_non_aggregated() {
             let user_identity_string = self
                 .downstreams
@@ -504,11 +506,29 @@ impl Sv1Server {
                 .unwrap()
                 .downstream_data
                 .super_safe_lock(|d| d.user_identity.clone());
-            UserIdentity::new(&user_identity_string)
-                .unwrap()
-                .to_tlv()
-                .ok()
-                .map(|tlv| vec![tlv])
+            // Extract worker suffix from hpub format, or use full string if not hpub
+            let worker_name = ehash_core::extract_worker_suffix(&user_identity_string)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    // If no hpub format detected, check if the string is short enough
+                    // to use directly (non-ehash miners)
+                    if user_identity_string.len() <= 32
+                        && !user_identity_string.to_lowercase().starts_with("hpub")
+                    {
+                        user_identity_string.clone()
+                    } else {
+                        // hpub without worker suffix - no TLV needed
+                        String::new()
+                    }
+                });
+            if worker_name.is_empty() {
+                None
+            } else {
+                UserIdentity::new(&worker_name)
+                    .ok()
+                    .and_then(|ui| ui.to_tlv().ok())
+                    .map(|tlv| vec![tlv])
+            }
         } else {
             None
         };

@@ -1205,8 +1205,18 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 vardiff.increment_shares_since_last_update();
 
                 // In developer mode, skip PoW validation and treat share as valid
+                // Generate a unique hash from share data to avoid duplicate detection
                 let res = if developer_mode {
-                    Ok(ShareValidationResult::Valid(Hash::all_zeros()))
+                    use stratum_apps::stratum_core::bitcoin::hashes::sha256d;
+                    // Create unique hash from: downstream_id + channel_id + sequence + nonce + ntime
+                    let mut data = Vec::with_capacity(24);
+                    data.extend_from_slice(&(downstream_id as u64).to_le_bytes());
+                    data.extend_from_slice(&channel_id.to_le_bytes());
+                    data.extend_from_slice(&msg.sequence_number.to_le_bytes());
+                    data.extend_from_slice(&msg.nonce.to_le_bytes());
+                    data.extend_from_slice(&msg.ntime.to_le_bytes());
+                    let dev_hash = sha256d::Hash::hash(&data);
+                    Ok(ShareValidationResult::Valid(dev_hash.into()))
                 } else {
                     extended_channel.validate_share(msg.clone())
                 };

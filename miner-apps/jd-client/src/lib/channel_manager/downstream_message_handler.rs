@@ -31,6 +31,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     channel_manager::{ChannelManager, ChannelManagerChannel, FULL_EXTRANONCE_SIZE},
+    ehash_mint::{PendingChannelShares, PendingShareData, ShareReportData},
     error::{self, JDCError, JDCErrorKind},
     jd_mode::{get_jd_mode, JdMode},
     utils::create_close_channel_msg,
@@ -1210,6 +1211,8 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     extended_channel.validate_share(msg.clone())
                 };
                 let mut is_downstream_share_valid = false;
+                let mut ehash_share_hash: Option<[u8; 32]> = None;
+                let mut ehash_block_found = false;
                 match res {
                     Ok(ShareValidationResult::Valid(share_hash)) => {
                         let share_accounting = extended_channel.get_share_accounting();
@@ -1229,6 +1232,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             );
                         }
                         is_downstream_share_valid = true;
+                        ehash_share_hash = Some(share_hash.to_byte_array());
                     }
                     Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase)) => {
                         info!("SubmitSharesExtended on downstream channel: 💰 Block Found!!! 💰{share_hash}");
@@ -1251,6 +1255,8 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             new_shares_sum: share_accounting.get_last_batch_work_sum() as u64,
                         };
                         is_downstream_share_valid = true;
+                        ehash_share_hash = Some(share_hash.to_byte_array());
+                        ehash_block_found = true;
                         messages.push((
                             downstream.downstream_id,
                             Mining::SubmitSharesSuccess(success),
@@ -1273,6 +1279,64 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
                 if !is_downstream_share_valid{
                     return Ok(messages);
+                }
+
+                // Send share report to ehash-mint if configured
+                if let Some(share_hash) = ehash_share_hash {
+                    // Calculate difficulty ratio: network_difficulty / channel_difficulty
+                    // Lower target = higher difficulty, so ratio = network_target / channel_target
+                    let channel_target_bytes = extended_channel.get_target().to_le_bytes();
+                    let network_target_bytes = prev_hash.target.inner_as_ref();
+                    // Convert targets to f64 for ratio calculation using first 8 bytes
+                    let difficulty_ratio = {
+                        let channel_val = u64::from_le_bytes(channel_target_bytes[0..8].try_into().unwrap_or([0u8; 8]));
+                        let network_val = u64::from_le_bytes(network_target_bytes[0..8].try_into().unwrap_or([1u8; 8]));
+                        if channel_val == 0 {
+                            0.001 // Fallback for regtest/edge cases
+                        } else {
+                            (network_val as f64) / (channel_val as f64)
+                        }
+                    };
+
+                    // Look up pubkey for this channel
+                    if let Some(pubkey) = channel_manager_data.ehash_pubkey_store.get(downstream_id, channel_id) {
+                        // Pubkey is registered - send share report directly
+                        let mut pubkey_bytes = [0u8; 33];
+                        pubkey_bytes.copy_from_slice(pubkey.as_bytes());
+                        let report = ShareReportData {
+                            pubkey: pubkey_bytes,
+                            share_hash,
+                            difficulty_ratio,
+                            block_found: ehash_block_found,
+                        };
+                        debug!(
+                            downstream_id,
+                            channel_id,
+                            difficulty_ratio,
+                            block_found = ehash_block_found,
+                            "Sending share report to ehash-mint"
+                        );
+                        channel_manager_data.ehash_report_sender.try_send_share(report);
+                    } else {
+                        // Pubkey not yet registered - buffer the share
+                        let key = (downstream_id, channel_id);
+                        let pending = channel_manager_data.pending_ehash_shares
+                            .entry(key)
+                            .or_insert_with(|| PendingChannelShares::new(
+                                channel_manager_data.ehash_pubkey_timeout_secs
+                            ));
+                        pending.push(PendingShareData {
+                            share_hash,
+                            difficulty_ratio,
+                            block_found: ehash_block_found,
+                        });
+                        debug!(
+                            downstream_id,
+                            channel_id,
+                            buffered_count = pending.shares.len(),
+                            "Buffered share pending RegisterChannelPubkey"
+                        );
+                    }
                 }
 
                 if let Some(upstream_channel) = channel_manager_data.upstream_channel.as_mut() {

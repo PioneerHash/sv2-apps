@@ -17,18 +17,24 @@ name = "jd_server"
 path = "src/lib/mod.rs"
 
 [dependencies]
-stratum-common = { git = "https://github.com/stratum-mining/stratum", rev = "v1.5.0", features = ["with_network_helpers"] }
+# Use stratum-apps for unified transport layer and protocol types
+stratum-apps = { path = "../../stratum-apps", features = ["jd_server"] }
+
 async-channel = "1.5.1"
 rand = "0.8.4"
 tokio = { version = "1.44.1", features = ["full"] }
 ext-config = { version = "0.14.0", features = ["toml"], package = "config" }
 tracing = { version = "0.1" }
-error_handling = { git = "https://github.com/stratum-mining/stratum", rev = "v1.5.0" }
 nohash-hasher = "0.2.0"
 serde = { version = "1.0.89", features = ["derive", "alloc"], default-features = false }
 hashbrown = { version = "0.11", default-features = false, features = ["ahash", "serde"] }
-key-utils = { git = "https://github.com/stratum-mining/stratum", rev = "v1.5.0" }
-rpc_sv2 = { git = "https://github.com/stratum-mining/stratum", rev = "v1.5.0" }
 hex = "0.4.3"
-config_helpers_sv2 = { git = "https://github.com/stratum-mining/stratum", rev = "v1.5.0" }
 clap = { version = "4.5.39", features = ["derive"] }
+
+# RPC client for Bitcoin Core interaction
+bitcoincore-rpc = "0.19"
+
+[features]
+default = []
+# iroh-transport feature is disabled until JD-Server is migrated to stratum-apps
+# iroh-transport = ["stratum-apps/iroh-transport"]

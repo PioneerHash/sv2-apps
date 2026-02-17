@@ -19,30 +19,32 @@
 
 pub mod message_handler;
 use super::{
-    error::JdsError, mempool::JDsMempool, status, EitherFrame, JobDeclaratorServerConfig, StdFrame,
+    error::JdsError,
+    mempool::JDsMempool,
+    status,
+    utils::{BlockCreator, Id},
+    EitherFrame, JobDeclaratorServerConfig, StdFrame,
 };
+use crate::handle_result;
 use async_channel::{Receiver, Sender};
 use core::panic;
-use error_handling::handle_result;
-use key_utils::{Secp256k1PublicKey, Secp256k1SecretKey, SignatureService};
 use nohash_hasher::BuildNoHashHasher;
 use std::{collections::HashMap, convert::TryInto, sync::Arc};
-use stratum_common::{
-    network_helpers_sv2::noise_connection::Connection,
-    roles_logic_sv2::{
-        self,
+use stratum_apps::{
+    custom_mutex::Mutex,
+    key_utils::{Secp256k1PublicKey, Secp256k1SecretKey, SignatureService},
+    network_helpers::noise_connection::Connection,
+    stratum_core::{
+        binary_sv2::{self, B0255, U256},
         bitcoin::{consensus::encode::serialize, Amount, Block, Transaction, TxOut, Txid},
-        codec_sv2::{
-            binary_sv2::{self, B0255, U256},
-            HandshakeRole, Responder,
-        },
+        codec_sv2::HandshakeRole,
         common_messages_sv2::{
             Protocol, SetupConnection, SetupConnectionError, SetupConnectionSuccess,
         },
-        handlers::job_declaration::{ParseJobDeclarationMessagesFromDownstream, SendTo},
+        handlers_sv2::HandleJobDeclarationMessagesFromClientSync,
         job_declaration_sv2::{DeclareMiningJob, PushSolution},
+        noise_sv2::Responder,
         parsers_sv2::{AnyMessage as JdsMessages, JobDeclaration},
-        utils::{Id, Mutex},
     },
 };
 use tokio::{net::TcpListener, time::Duration};
@@ -105,6 +107,12 @@ pub struct JobDeclaratorDownstream {
         Vec<u16>,
     ),
     add_txs_to_mempool: AddTrasactionsToMempool,
+    /// Pending response message to send to downstream
+    pending_response: Option<JobDeclaration<'static>>,
+    /// Flag indicating if transactions should be sent to mempool
+    should_send_txs_to_mempool: bool,
+    /// Pending push solution to process
+    pending_push_solution: Option<PushSolution<'static>>,
 }
 
 impl JobDeclaratorDownstream {
@@ -144,6 +152,9 @@ impl JobDeclaratorDownstream {
                 add_txs_to_mempool_inner,
                 sender_add_txs_to_mempool,
             },
+            pending_response: None,
+            should_send_txs_to_mempool: false,
+            pending_push_solution: None,
         }
     }
 
@@ -157,9 +168,7 @@ impl JobDeclaratorDownstream {
             .map_err(|e| Box::new(JdsError::PoisonLock(e.to_string())))?;
         let last_declare = last_declare_.ok_or(Box::new(JdsError::NoLastDeclaredJob))?;
         let transactions_list = Self::collect_txs_in_job(self_mutex)?;
-        let block: Block =
-            roles_logic_sv2::utils::BlockCreator::new(last_declare, transactions_list, message)
-                .into();
+        let block: Block = BlockCreator::new(last_declare, transactions_list, message).into();
         Ok(hex::encode(serialize(&block)))
     }
 
@@ -232,7 +241,7 @@ impl JobDeclaratorDownstream {
     /// Wraps the message into a `StdFrame` and sends it through the established channel.
     pub async fn send(
         self_mutex: Arc<Mutex<Self>>,
-        message: roles_logic_sv2::parsers_sv2::JobDeclaration<'static>,
+        message: JobDeclaration<'static>,
     ) -> Result<(), ()> {
         let sv2_frame: StdFrame = JdsMessages::JobDeclaration(message).try_into().unwrap();
         let sender = self_mutex.safe_lock(|self_| self_.sender.clone()).unwrap();
@@ -243,7 +252,7 @@ impl JobDeclaratorDownstream {
     /// Starts the message processing loop for this downstream connection.
     ///
     /// - Waits for incoming SV2 messages
-    /// - Delegates message parsing to [`ParseJobDeclarationMessagesFromDownstream`]
+    /// - Delegates message parsing to [`HandleJobDeclarationMessagesFromClientSync`]
     /// - Sends appropriate responses back to the client
     /// - Updates the JDS mempool as needed
     ///
@@ -258,174 +267,145 @@ impl JobDeclaratorDownstream {
             loop {
                 match recv.recv().await {
                     Ok(message) => {
-                        let mut frame: StdFrame = handle_result!(tx_status, message.try_into());
-                        let header = frame
+                        // EitherFrame from Connection - extract the Sv2 frame
+                        let mut sv2_frame = match message {
+                            EitherFrame::Sv2(frame) => frame,
+                            EitherFrame::HandShake(_) => {
+                                handle_result!(
+                                    tx_status,
+                                    Err(JdsError::Custom("Unexpected handshake frame".to_string()))
+                                );
+                                continue;
+                            }
+                        };
+                        let header = sv2_frame
                             .get_header()
                             .ok_or_else(|| JdsError::Custom(String::from("No header set")));
                         let header = handle_result!(tx_status, header);
-                        let message_type = header.msg_type();
-                        let payload = frame.payload();
-                        let next_message_to_send =
-                            ParseJobDeclarationMessagesFromDownstream::handle_message_job_declaration(
-                                self_mutex.clone(),
-                                message_type,
-                                payload,
-                            );
-                        // How works the txs recognition and txs storing in JDS mempool
-                        // when a DMJ arrives, the JDS compares the received transactions with the
-                        // ids in the the JDS mempool. Then there are two scenarios
-                        // 1. the JDS recognizes all the transactions. Then, just before a DMJS is
-                        //    sent, the JDS mempool is triggered to fill in the JDS mempool the id
-                        //    of declared job with the full transaction (with send_tx_to_mempool
-                        //    method(), that eventually will ask the transactions to a bitcoin node
-                        //    via RPC)
-                        // 2. there are some unknown txids. Just before sending PMT, the JDS mempool
-                        //    is triggered to fill the known txids with the full transactions. When
-                        //    a PMTS arrives, just before sending a DMJS, the unknown full
-                        //    transactions provided by the downstream are added to the JDS mempool
-                        match next_message_to_send {
-                            Ok(SendTo::Respond(m)) => {
-                                match m {
-                                    JobDeclaration::AllocateMiningJobToken(_) => {
-                                        error!("Send unexpected message: AMJT");
+                        let payload = sv2_frame.payload();
+
+                        // Use the new handler API - header is already the correct type
+                        // Convert PoisonError to JdsError immediately to avoid holding
+                        // non-Send type across await boundaries
+                        let result = self_mutex
+                            .safe_lock(|downstream| {
+                                downstream.handle_job_declaration_message_frame_from_client(
+                                    None, header, payload,
+                                )
+                            })
+                            .map_err(|e| JdsError::PoisonLock(e.to_string()));
+
+                        match result {
+                            Ok(Ok(())) => {
+                                // Check for pending response
+                                let (pending_response, should_send_txs, pending_solution) =
+                                    self_mutex
+                                        .safe_lock(|d| {
+                                            let resp = d.pending_response.take();
+                                            let send_txs = d.should_send_txs_to_mempool;
+                                            d.should_send_txs_to_mempool = false;
+                                            let solution = d.pending_push_solution.take();
+                                            (resp, send_txs, solution)
+                                        })
+                                        .unwrap();
+
+                                // Handle pending response
+                                if let Some(response) = pending_response {
+                                    match &response {
+                                        JobDeclaration::AllocateMiningJobTokenSuccess(_) => {
+                                            debug!("Send message: AMJTS");
+                                        }
+                                        JobDeclaration::DeclareMiningJobSuccess(_) => {
+                                            debug!("Send message: DMJS. Updating the JDS mempool.");
+                                        }
+                                        JobDeclaration::DeclareMiningJobError(_) => {
+                                            debug!("Send message: DMJE");
+                                        }
+                                        JobDeclaration::ProvideMissingTransactions(_) => {
+                                            debug!("Send message: PMT. Updating the JDS mempool.");
+                                        }
+                                        _ => {}
                                     }
-                                    JobDeclaration::AllocateMiningJobTokenSuccess(_) => {
-                                        debug!("Send message: AMJTS");
-                                    }
-                                    JobDeclaration::DeclareMiningJob(_) => {
-                                        error!("Send unexpected message: DMJ");
-                                    }
-                                    JobDeclaration::DeclareMiningJobError(_) => {
-                                        debug!("Send nmessage: DMJE");
-                                    }
-                                    JobDeclaration::DeclareMiningJobSuccess(_) => {
-                                        debug!("Send message: DMJS. Updating the JDS mempool.");
+
+                                    if should_send_txs {
                                         Self::send_txs_to_mempool(self_mutex.clone()).await;
                                     }
-                                    JobDeclaration::ProvideMissingTransactions(_) => {
-                                        debug!("Send message: PMT. Updating the JDS mempool.");
-                                        Self::send_txs_to_mempool(self_mutex.clone()).await;
-                                    }
-                                    JobDeclaration::ProvideMissingTransactionsSuccess(_) => {
-                                        error!("Send unexpected PMTS");
-                                    }
-                                    JobDeclaration::PushSolution(_) => todo!(),
+
+                                    Self::send(self_mutex.clone(), response).await.unwrap();
                                 }
-                                Self::send(self_mutex.clone(), m).await.unwrap();
-                            }
-                            Ok(SendTo::RelayNewMessage(message)) => {
-                                error!("JD Server: unexpected relay new message {}", message);
-                            }
-                            Ok(SendTo::RelayNewMessageToRemote(remote, message)) => {
-                                error!(
-                                    "JD Server: unexpected relay new message to remote. Remote: {:?}, Message: {}",
-                                    remote,
-                                    message
-                                );
-                            }
-                            Ok(SendTo::RelaySameMessageToRemote(remote)) => {
-                                error!(
-                                    "JD Server: unexpected relay same message to remote. Remote: {:?}",
-                                    remote
-                                );
-                            }
-                            Ok(SendTo::Multiple(multiple)) => {
-                                error!("JD Server: unexpected multiple messages: {:?}", multiple);
-                            }
-                            Ok(SendTo::None(m)) => {
-                                match m {
-                                    Some(JobDeclaration::PushSolution(message)) => {
-                                        match Self::collect_txs_in_job(self_mutex.clone()) {
-                                            Ok(_) => {
-                                                info!(
-                                                    "All transactions in downstream job are recognized correctly by the JD Server"
-                                                );
-                                                let hexdata =
-                                                    match JobDeclaratorDownstream::get_block_hex(
-                                                        self_mutex.clone(),
-                                                        message,
-                                                    ) {
-                                                        Ok(inner) => inner,
-                                                        Err(e) => {
-                                                            error!(
+
+                                // Handle pending push solution
+                                if let Some(message) = pending_solution {
+                                    match Self::collect_txs_in_job(self_mutex.clone()) {
+                                        Ok(_) => {
+                                            info!(
+                                                "All transactions in downstream job are recognized correctly by the JD Server"
+                                            );
+                                            let hexdata =
+                                                match JobDeclaratorDownstream::get_block_hex(
+                                                    self_mutex.clone(),
+                                                    message,
+                                                ) {
+                                                    Ok(inner) => inner,
+                                                    Err(e) => {
+                                                        error!(
                                                             "Received solution but encountered error: {:?}",
                                                             e
                                                         );
-                                                            recv.close();
-                                                            //TODO should we brake it?
-                                                            break;
+                                                        recv.close();
+                                                        break;
+                                                    }
+                                                };
+                                            let _ = new_block_sender.send(hexdata).await;
+                                        }
+                                        Err(error) => {
+                                            error!("Missing transactions: {:?}", error);
+                                            let known_transactions =
+                                                JobDeclaratorDownstream::get_transactions_in_job(
+                                                    self_mutex.clone(),
+                                                );
+                                            let retrieve_transactions =
+                                                AddTrasactionsToMempoolInner {
+                                                    known_transactions,
+                                                    unknown_transactions: Vec::new(),
+                                                };
+                                            let mempool = self_mutex
+                                                .clone()
+                                                .safe_lock(|a| a.mempool.clone())
+                                                .unwrap();
+                                            tokio::select! {
+                                                _ = JDsMempool::add_tx_data_to_mempool(mempool, retrieve_transactions) => {
+                                                    match JobDeclaratorDownstream::get_block_hex(
+                                                        self_mutex.clone(),
+                                                        message.clone(),
+                                                    ) {
+                                                        Ok(hexdata) => {
+                                                            let _ = new_block_sender.send(hexdata).await;
+                                                        },
+                                                        Err(e) => {
+                                                            handle_result!(
+                                                                tx_status,
+                                                                Err(*e)
+                                                            );
                                                         }
                                                     };
-                                                let _ = new_block_sender.send(hexdata).await;
-                                            }
-                                            Err(error) => {
-                                                error!("Missing transactions: {:?}", error);
-                                                // TODO print here the ip of the downstream
-                                                let known_transactions =
-                                                    JobDeclaratorDownstream::get_transactions_in_job(
-                                                        self_mutex.clone()
-                                                    );
-                                                let retrieve_transactions =
-                                                    AddTrasactionsToMempoolInner {
-                                                        known_transactions,
-                                                        unknown_transactions: Vec::new(),
-                                                    };
-                                                let mempool = self_mutex
-                                                    .clone()
-                                                    .safe_lock(|a| a.mempool.clone())
-                                                    .unwrap();
-                                                tokio::select! {
-                                                    _ = JDsMempool::add_tx_data_to_mempool(mempool, retrieve_transactions) => {
-                                                        match JobDeclaratorDownstream::get_block_hex(
-                                                            self_mutex.clone(),
-                                                            message.clone(),
-                                                        ) {
-                                                            Ok(hexdata) => {
-                                                                let _ = new_block_sender.send(hexdata).await;
-                                                            },
-                                                            Err(e) => {
-                                                                handle_result!(
-                                                                    tx_status,
-                                                                    Err(*e)
-                                                                );
-                                                            }
-                                                        };
-                                                    }
-                                                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
                                                 }
+                                                _ = tokio::time::sleep(Duration::from_secs(60)) => {}
                                             }
-                                        };
-                                    }
-                                    Some(JobDeclaration::DeclareMiningJob(_)) => {
-                                        error!("JD Server received an unexpected message {:?}", m);
-                                    }
-                                    Some(JobDeclaration::DeclareMiningJobSuccess(_)) => {
-                                        error!("JD Server received an unexpected message {:?}", m);
-                                    }
-                                    Some(JobDeclaration::DeclareMiningJobError(_)) => {
-                                        error!("JD Server received an unexpected message {:?}", m);
-                                    }
-                                    Some(JobDeclaration::AllocateMiningJobToken(_)) => {
-                                        error!("JD Server received an unexpected message {:?}", m);
-                                    }
-                                    Some(JobDeclaration::AllocateMiningJobTokenSuccess(_)) => {
-                                        error!("JD Server received an unexpected message {:?}", m);
-                                    }
-                                    Some(JobDeclaration::ProvideMissingTransactions(_)) => {
-                                        error!("JD Server received an unexpected message {:?}", m);
-                                    }
-                                    Some(JobDeclaration::ProvideMissingTransactionsSuccess(_)) => {
-                                        error!("JD Server received an unexpected message {:?}", m);
-                                    }
-                                    None => (),
+                                        }
+                                    };
                                 }
                             }
-                            Err(e) => {
-                                error!("{:?}", e);
-                                handle_result!(
-                                    tx_status,
-                                    Err(JdsError::Custom("Invalid message received".to_string()))
-                                );
+                            Ok(Err(e)) => {
+                                error!("Handler error: {:?}", e);
+                                handle_result!(tx_status, Err(e));
+                                recv.close();
+                                break;
+                            }
+                            Err(err) => {
+                                // err is already JdsError from the map_err above
+                                error!("Lock error: {:?}", err);
+                                handle_result!(tx_status, Err(err));
                                 recv.close();
                                 break;
                             }

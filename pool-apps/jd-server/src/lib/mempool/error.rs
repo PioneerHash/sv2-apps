@@ -11,7 +11,7 @@
 //! It also includes a centralized error logging helper (`handle_error`) to standardize warnings
 //! and diagnostics across components.
 
-use rpc_sv2::mini_rpc_client::RpcError;
+use bitcoincore_rpc::Error as RpcError;
 use std::{convert::From, sync::PoisonError};
 use tracing::{error, warn};
 

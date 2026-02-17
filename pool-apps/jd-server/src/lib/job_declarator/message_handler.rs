@@ -1,28 +1,32 @@
+//! Message handler implementation for Job Declaration protocol.
+//!
+//! Implements the `HandleJobDeclarationMessagesFromClientSync` trait for processing
+//! messages from downstream JD clients.
+
 use std::{convert::TryInto, io::Cursor, sync::Arc};
-use stratum_common::roles_logic_sv2::{
-    bitcoin::{
-        consensus::Decodable as BitcoinDecodable,
-        hashes::{sha256d, Hash},
-        Transaction, Txid,
+use stratum_apps::{
+    custom_mutex::Mutex,
+    stratum_core::{
+        binary_sv2::{Decodable, Serialize, U256},
+        bitcoin::{
+            consensus::Decodable as BitcoinDecodable,
+            hashes::{sha256d, Hash},
+            Transaction, Txid,
+        },
+        handlers_sv2::HandleJobDeclarationMessagesFromClientSync,
+        job_declaration_sv2::{
+            AllocateMiningJobToken, AllocateMiningJobTokenSuccess, DeclareMiningJob,
+            DeclareMiningJobError, DeclareMiningJobSuccess, ProvideMissingTransactions,
+            ProvideMissingTransactionsSuccess, PushSolution,
+        },
+        parsers_sv2::{JobDeclaration, Tlv},
     },
-    codec_sv2::binary_sv2::{Decodable, Serialize, U256},
-    handlers::{job_declaration::ParseJobDeclarationMessagesFromDownstream, SendTo_},
-    job_declaration_sv2::{
-        AllocateMiningJobToken, AllocateMiningJobTokenSuccess, DeclareMiningJob,
-        DeclareMiningJobError, DeclareMiningJobSuccess, ProvideMissingTransactions,
-        ProvideMissingTransactionsSuccess, PushSolution,
-    },
-    parsers_sv2::JobDeclaration,
-    utils::Mutex,
 };
-pub type SendTo = SendTo_<JobDeclaration<'static>, ()>;
-use crate::mempool::JDsMempool;
 
-use super::{signed_token, TransactionState};
-use stratum_common::roles_logic_sv2::{errors::Error, parsers_sv2::AnyMessage as AllMessages};
+use crate::{error::JdsError, mempool::JDsMempool};
+
+use super::{signed_token, JobDeclaratorDownstream, TransactionState};
 use tracing::{debug, info};
-
-use super::JobDeclaratorDownstream;
 
 impl JobDeclaratorDownstream {
     fn verify_job(&mut self, message: &DeclareMiningJob) -> bool {
@@ -44,11 +48,23 @@ impl JobDeclaratorDownstream {
     }
 }
 
-impl ParseJobDeclarationMessagesFromDownstream for JobDeclaratorDownstream {
+impl HandleJobDeclarationMessagesFromClientSync for JobDeclaratorDownstream {
+    type Error = JdsError;
+
+    fn get_negotiated_extensions_with_client(
+        &self,
+        _client_id: Option<usize>,
+    ) -> Result<Vec<u16>, Self::Error> {
+        // No extensions negotiated for now
+        Ok(vec![])
+    }
+
     fn handle_allocate_mining_job_token(
         &mut self,
+        _client_id: Option<usize>,
         message: AllocateMiningJobToken,
-    ) -> Result<SendTo, Error> {
+        _tlv_fields: Option<&[Tlv]>,
+    ) -> Result<(), Self::Error> {
         info!(
             "Received `AllocateMiningJobToken` with id: {}",
             message.request_id
@@ -66,14 +82,22 @@ impl ParseJobDeclarationMessagesFromDownstream for JobDeclaratorDownstream {
             "Sending AllocateMiningJobTokenSuccess to proxy {}",
             message_enum
         );
-        Ok(SendTo::Respond(message_enum))
+
+        // Store the response to be sent
+        self.pending_response = Some(message_enum);
+        Ok(())
     }
 
     // Transactions that are present in the mempool are stored here, that is sent to the
     // mempool which use the rpc client to retrieve the whole data for each transaction.
     // The unknown transactions is a vector that contains the transactions that are not in the
     // jds mempool, and will be non-empty in the ProvideMissingTransactionsSuccess message
-    fn handle_declare_mining_job(&mut self, message: DeclareMiningJob) -> Result<SendTo, Error> {
+    fn handle_declare_mining_job(
+        &mut self,
+        _client_id: Option<usize>,
+        message: DeclareMiningJob,
+        _tlv_fields: Option<&[Tlv]>,
+    ) -> Result<(), Self::Error> {
         info!(
             "Received `DeclareMiningJob` with id: {}",
             message.request_id
@@ -84,12 +108,13 @@ impl ParseJobDeclarationMessagesFromDownstream for JobDeclaratorDownstream {
         }
         let mut known_transactions: Vec<Txid> = vec![];
         if self.verify_job(&message) {
-            let txids = message.tx_ids_list.inner_as_ref();
+            let txids = message.wtxid_list.inner_as_ref();
             let mempool = self.mempool.safe_lock(|x| x.mempool.clone())?;
             let mut transactions_with_state = vec![TransactionState::Missing; txids.len()];
             let mut missing_txs: Vec<u16> = Vec::new();
             for (i, txid) in txids.iter().enumerate() {
-                let hash = sha256d::Hash::from_slice(txid)?;
+                let hash =
+                    sha256d::Hash::from_slice(txid).map_err(|e| JdsError::Custom(e.to_string()))?;
                 let txid = Txid::from(hash);
                 match mempool.contains_key(&txid) {
                     true => {
@@ -113,19 +138,23 @@ impl ParseJobDeclarationMessagesFromDownstream for JobDeclaratorDownstream {
                 .known_transactions
                 .append(&mut known_transactions);
             let mut full_token = [0u8; 255];
-            message.mining_job_token.to_bytes(&mut full_token)?;
+            message
+                .mining_job_token
+                .to_bytes(&mut full_token)
+                .map_err(|e| JdsError::BinarySv2(e))?;
             let mining_job_token = &mut full_token[..32];
             if missing_txs.is_empty() {
                 let message_success = DeclareMiningJobSuccess {
                     request_id: message.request_id,
                     new_mining_job_token: signed_token(
-                        U256::from_bytes(mining_job_token)?,
+                        U256::from_bytes(mining_job_token).map_err(|e| JdsError::BinarySv2(e))?,
                         &self.public_key.clone(),
                         &self.private_key.clone(),
                     ),
                 };
                 let message_enum_success = JobDeclaration::DeclareMiningJobSuccess(message_success);
-                Ok(SendTo::Respond(message_enum_success))
+                self.pending_response = Some(message_enum_success);
+                self.should_send_txs_to_mempool = true;
             } else {
                 let message_provide_missing_transactions = ProvideMissingTransactions {
                     request_id: message.request_id,
@@ -135,7 +164,8 @@ impl ParseJobDeclarationMessagesFromDownstream for JobDeclaratorDownstream {
                     JobDeclaration::ProvideMissingTransactions(
                         message_provide_missing_transactions,
                     );
-                Ok(SendTo::Respond(message_enum_provide_missing_transactions))
+                self.pending_response = Some(message_enum_provide_missing_transactions);
+                self.should_send_txs_to_mempool = true;
             }
         } else {
             let message_error = DeclareMiningJobError {
@@ -144,14 +174,17 @@ impl ParseJobDeclarationMessagesFromDownstream for JobDeclaratorDownstream {
                 error_details: Vec::new().try_into().unwrap(),
             };
             let message_enum_error = JobDeclaration::DeclareMiningJobError(message_error);
-            Ok(SendTo::Respond(message_enum_error))
+            self.pending_response = Some(message_enum_error);
         }
+        Ok(())
     }
 
     fn handle_provide_missing_transactions_success(
         &mut self,
+        _client_id: Option<usize>,
         message: ProvideMissingTransactionsSuccess,
-    ) -> Result<SendTo, Error> {
+        _tlv_fields: Option<&[Tlv]>,
+    ) -> Result<(), Self::Error> {
         info!(
             "Received `ProvideMissingTransactionsSuccess` with id: {}",
             message.request_id
@@ -170,18 +203,12 @@ impl ParseJobDeclarationMessagesFromDownstream for JobDeclaratorDownstream {
                         let mut cursor = Cursor::new(tx);
                         let transaction =
                             Transaction::consensus_decode_from_finite_reader(&mut cursor)
-                                .map_err(|e| Error::TxDecodingError(e.to_string()))?;
+                                .map_err(|e| JdsError::TxDecodingError(e.to_string()))?;
                         Vec::push(&mut unknown_transactions, transaction.clone());
-                        let index =
-                            *missing_indexes
-                                .get(i)
-                                .ok_or(Error::LogicErrorMessage(Box::new(
-                                    AllMessages::JobDeclaration(
-                                        JobDeclaration::ProvideMissingTransactionsSuccess(
-                                            message.clone().into_static(),
-                                        ),
-                                    ),
-                                )))? as usize;
+                        let index = *missing_indexes.get(i).ok_or(JdsError::Custom(format!(
+                            "Missing index {} for transaction",
+                            i
+                        )))? as usize;
                         // insert the missing transactions in the mempool
                         transactions_with_state[index] =
                             TransactionState::PresentInMempool(transaction.compute_txid());
@@ -194,38 +221,50 @@ impl ParseJobDeclarationMessagesFromDownstream for JobDeclaratorDownstream {
                     for tx_with_state in transactions_with_state {
                         match tx_with_state {
                             TransactionState::PresentInMempool(_) => continue,
-                            TransactionState::Missing => return Err(Error::JDSMissingTransactions),
+                            TransactionState::Missing => {
+                                return Err(JdsError::JDSMissingTransactions)
+                            }
                         }
                     }
                     let mut full_token = [0u8; 255];
                     declared_job
                         .mining_job_token
                         .clone()
-                        .to_bytes(&mut full_token)?;
+                        .to_bytes(&mut full_token)
+                        .map_err(|e| JdsError::BinarySv2(e))?;
                     let mining_job_token = &mut full_token[..32];
                     let message_success = DeclareMiningJobSuccess {
                         request_id: message.request_id,
                         new_mining_job_token: signed_token(
-                            U256::from_bytes(mining_job_token)?,
+                            U256::from_bytes(mining_job_token)
+                                .map_err(|e| JdsError::BinarySv2(e))?,
                             &self.public_key.clone(),
                             &self.private_key.clone(),
                         ),
                     };
                     let message_enum_success =
                         JobDeclaration::DeclareMiningJobSuccess(message_success);
-                    return Ok(SendTo::Respond(message_enum_success));
+                    self.pending_response = Some(message_enum_success);
+                    self.should_send_txs_to_mempool = true;
+                    return Ok(());
                 }
             }
-            None => return Err(Error::NoValidJob),
+            None => return Err(JdsError::NoValidJob),
         }
-        Ok(SendTo::None(None))
+        Ok(())
     }
 
-    fn handle_push_solution(&mut self, message: PushSolution<'_>) -> Result<SendTo, Error> {
+    fn handle_push_solution(
+        &mut self,
+        _client_id: Option<usize>,
+        message: PushSolution,
+        _tlv_fields: Option<&[Tlv]>,
+    ) -> Result<(), Self::Error> {
         info!("Received PushSolution from JDC");
         debug!("`PushSolution`: {}", message);
-        let m = JobDeclaration::PushSolution(message.clone().into_static());
-        Ok(SendTo::None(Some(m)))
+        // Store the solution for processing by the main loop
+        self.pending_push_solution = Some(message.into_static());
+        Ok(())
     }
 }
 
@@ -233,16 +272,16 @@ fn clear_declared_mining_job(
     old_mining_job: DeclareMiningJob,
     new_mining_job: &DeclareMiningJob,
     mempool: Arc<Mutex<JDsMempool>>,
-) -> Result<(), Error> {
-    let old_transactions = old_mining_job.tx_ids_list.inner_as_ref();
-    let new_transactions = new_mining_job.tx_ids_list.inner_as_ref();
+) -> Result<(), JdsError> {
+    let old_transactions = old_mining_job.wtxid_list.inner_as_ref();
+    let new_transactions = new_mining_job.wtxid_list.inner_as_ref();
 
     if old_transactions.is_empty() {
         info!("No transactions to remove from mempool");
         return Ok(());
     }
 
-    let result = mempool.safe_lock(|mempool_| -> Result<(), Error> {
+    let result = mempool.safe_lock(|mempool_| -> Result<(), JdsError> {
         let mempool_txs = mempool_.mempool.clone();
 
         for old_txid in old_transactions
@@ -287,5 +326,5 @@ fn clear_declared_mining_job(
         Ok(())
     })?;
 
-    result.map_err(|err| Error::PoisonLock(err.to_string()))
+    result.map_err(|err| JdsError::PoisonLock(err.to_string()))
 }

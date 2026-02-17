@@ -11,13 +11,13 @@
 //!
 //! Also defines a helper struct [`CoreRpc`] to group RPC parameters.
 
-pub use config_helpers_sv2::CoinbaseRewardScript;
-pub use key_utils::{Secp256k1PublicKey, Secp256k1SecretKey};
 use serde::Deserialize;
 use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+pub use stratum_apps::config_helpers::CoinbaseRewardScript;
+pub use stratum_apps::key_utils::{Secp256k1PublicKey, Secp256k1SecretKey};
 
 #[derive(Debug, serde::Deserialize, Clone)]
 pub struct JobDeclaratorServerConfig {
@@ -32,7 +32,7 @@ pub struct JobDeclaratorServerConfig {
     core_rpc_port: u16,
     core_rpc_user: String,
     core_rpc_pass: String,
-    #[serde(deserialize_with = "config_helpers_sv2::duration_from_toml")]
+    #[serde(deserialize_with = "stratum_apps::config_helpers::duration_from_toml")]
     mempool_update_interval: Duration,
     log_file: Option<PathBuf>,
 }
@@ -175,7 +175,7 @@ mod tests {
     use super::super::JobDeclaratorServer;
     use ext_config::{Config, ConfigError, File, FileFormat};
     use std::path::PathBuf;
-    use stratum_common::roles_logic_sv2::bitcoin::{self, Amount, ScriptBuf, TxOut};
+    use stratum_apps::stratum_core::bitcoin::{self, Amount, ScriptBuf, TxOut};
 
     use crate::config::JobDeclaratorServerConfig;
 
@@ -266,29 +266,20 @@ mod tests {
     fn test_get_coinbase_reward_script_empty() {
         let error =
             load_coinbase_config_str("\"\"").expect_err("cannot parse config with empty txout");
-        assert_eq!(
-            error.to_string(),
-            "Miniscript: unexpected «(0 args) while parsing Miniscript»",
-        );
+        assert_eq!(error.to_string(), "Miniscript: unrecognized name ''",);
     }
 
     #[test]
     fn test_get_invalid_miniscript_in_coinbase_reward_script() {
         let error = load_coinbase_config_str(&format!("\"INVALID\""))
             .expect_err("Cannot parse config with bad miniscript");
-        assert_eq!(
-            error.to_string(),
-            "Miniscript: unexpected «INVALID(0 args) while parsing Miniscript»",
-        );
+        assert_eq!(error.to_string(), "Miniscript: unrecognized name 'INVALID'",);
     }
 
     #[test]
     fn test_get_invalid_value_in_coinbase_reward_script() {
         let error = load_coinbase_config_str(&format!("\"wpkh({TEST_INVALID_PK_HEX})\""))
             .expect_err("Cannot parse config with bad pubkeys");
-        assert_eq!(
-            error.to_string(),
-            "Miniscript: unexpected «Error while parsing simple public key»",
-        );
+        assert_eq!(error.to_string(), "Miniscript: string error",);
     }
 }

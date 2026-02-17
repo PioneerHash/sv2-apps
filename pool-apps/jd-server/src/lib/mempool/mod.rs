@@ -19,12 +19,12 @@ pub mod error;
 use super::job_declarator::AddTrasactionsToMempoolInner;
 use crate::mempool::error::JdsMempoolError;
 use async_channel::Receiver;
+use bitcoincore_rpc::{Auth, Client, RpcApi};
 use hashbrown::HashMap;
-use rpc_sv2::{mini_rpc_client, mini_rpc_client::RpcError};
-use std::{str::FromStr, sync::Arc};
-use stratum_common::roles_logic_sv2::{
-    bitcoin::{blockdata::transaction::Transaction, hash_types::Txid},
-    utils::Mutex,
+use std::sync::Arc;
+use stratum_apps::{
+    custom_mutex::Mutex,
+    stratum_core::bitcoin::{blockdata::transaction::Transaction, hash_types::Txid},
 };
 
 /// Wrapper around a known transaction and its hash.
@@ -35,28 +35,20 @@ pub struct TransactionWithHash {
 }
 
 /// Internal representation of the JDS mempool.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct JDsMempool {
     /// Local map of known txids and their associated data (if available).
     pub mempool: HashMap<Txid, Option<(Transaction, u32)>>,
-    /// Auth for RPC connection to the node.
-    auth: mini_rpc_client::Auth,
-    /// URI of the Bitcoin node.
-    url: rpc_sv2::Uri,
+    /// RPC client for Bitcoin Core interaction.
+    client: Option<Client>,
     /// Receiver for new block solutions coming from JDC.
     new_block_receiver: Receiver<String>,
 }
 
 impl JDsMempool {
-    /// Returns a MiniRpcClient if the URL looks valid.
-    pub fn get_client(&self) -> Option<mini_rpc_client::MiniRpcClient> {
-        let url = self.url.to_string();
-        if url.contains("http") {
-            let client = mini_rpc_client::MiniRpcClient::new(self.url.clone(), self.auth.clone());
-            Some(client)
-        } else {
-            None
-        }
+    /// Returns a reference to the RPC client if available.
+    pub fn get_client(&self) -> Option<&Client> {
+        self.client.as_ref()
     }
 
     /// This function is used only for debug purposes and should not be used
@@ -70,27 +62,60 @@ impl JDsMempool {
 
     /// Instantiates a new empty mempool for JDS.
     pub fn new(
-        url: rpc_sv2::Uri,
+        url: String,
         username: String,
         password: String,
         new_block_receiver: Receiver<String>,
     ) -> Self {
-        let auth = mini_rpc_client::Auth::new(username, password);
         let empty_mempool: HashMap<Txid, Option<(Transaction, u32)>> = HashMap::new();
+
+        // Create the bitcoincore-rpc client
+        let client = if url.contains("http") {
+            match Client::new(&url, Auth::UserPass(username, password)) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::error!("Failed to create RPC client: {:?}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         JDsMempool {
             mempool: empty_mempool,
-            auth,
-            url,
+            client,
             new_block_receiver,
         }
     }
 
     /// Simple RPC ping to verify connection to Bitcoin node.
     pub async fn health(self_: Arc<Mutex<Self>>) -> Result<(), JdsMempoolError> {
-        let client = self_
-            .safe_lock(|a| a.get_client())?
-            .ok_or(JdsMempoolError::NoClient)?;
-        client.health().await.map_err(JdsMempoolError::Rpc)
+        let client_exists = self_.safe_lock(|a| a.client.is_some())?;
+        if !client_exists {
+            return Err(JdsMempoolError::NoClient);
+        }
+
+        // Run the blocking RPC call in a spawn_blocking task
+        let self_clone = self_.clone();
+        tokio::task::spawn_blocking(move || {
+            self_clone
+                .safe_lock(|a| {
+                    if let Some(client) = &a.client {
+                        client.get_blockchain_info().map(|_| ())
+                    } else {
+                        Err(bitcoincore_rpc::Error::JsonRpc(
+                            bitcoincore_rpc::jsonrpc::Error::Transport(Box::new(
+                                std::io::Error::new(std::io::ErrorKind::NotConnected, "No client"),
+                            )),
+                        ))
+                    }
+                })
+                .map_err(|e| JdsMempoolError::PoisonLock(e.to_string()))?
+                .map_err(JdsMempoolError::Rpc)
+        })
+        .await
+        .map_err(|e| JdsMempoolError::PoisonLock(e.to_string()))?
     }
 
     /// Inserts transactions into the mempool:
@@ -102,20 +127,42 @@ impl JDsMempool {
     ) -> Result<(), JdsMempoolError> {
         let txids = add_txs_to_mempool_inner.known_transactions;
         let transactions = add_txs_to_mempool_inner.unknown_transactions;
-        let client = self_
-            .safe_lock(|a| a.get_client())?
-            .ok_or(JdsMempoolError::NoClient)?;
-        // fill in the mempool the transactions id in the mempool with the full transactions
-        // retrieved from the jd client
+
+        let client_exists = self_.safe_lock(|a| a.client.is_some())?;
+        if !client_exists {
+            return Err(JdsMempoolError::NoClient);
+        }
+
+        // Fetch transactions from Bitcoin node for known txids
         for txid in txids {
-            if let Some(None) = self_
-                .safe_lock(|a| a.mempool.get(&txid).cloned())
-                .map_err(|e| JdsMempoolError::PoisonLock(e.to_string()))?
-            {
-                let transaction = client
-                    .get_raw_transaction(&txid.to_string(), None)
-                    .await
-                    .map_err(JdsMempoolError::Rpc)?;
+            let needs_fetch = self_
+                .safe_lock(|a| matches!(a.mempool.get(&txid), Some(None)))
+                .map_err(|e| JdsMempoolError::PoisonLock(e.to_string()))?;
+
+            if needs_fetch {
+                let self_clone = self_.clone();
+                let transaction = tokio::task::spawn_blocking(move || {
+                    self_clone
+                        .safe_lock(|a| {
+                            if let Some(client) = &a.client {
+                                client.get_raw_transaction(&txid, None)
+                            } else {
+                                Err(bitcoincore_rpc::Error::JsonRpc(
+                                    bitcoincore_rpc::jsonrpc::Error::Transport(Box::new(
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::NotConnected,
+                                            "No client",
+                                        ),
+                                    )),
+                                ))
+                            }
+                        })
+                        .map_err(|e| JdsMempoolError::PoisonLock(e.to_string()))?
+                        .map_err(JdsMempoolError::Rpc)
+                })
+                .await
+                .map_err(|e| JdsMempoolError::PoisonLock(e.to_string()))??;
+
                 let _ = self_.safe_lock(|a| {
                     a.mempool
                         .entry(transaction.compute_txid())
@@ -131,7 +178,7 @@ impl JDsMempool {
             }
         }
 
-        // fill in the mempool the transactions given in input
+        // Insert directly provided transactions
         for transaction in transactions {
             let _ = self_.safe_lock(|a| {
                 a.mempool
@@ -152,21 +199,31 @@ impl JDsMempool {
     /// Periodically synchronizes the mempool with the Bitcoin node.
     /// This only inserts thin entries (`None` as value), not full transactions.
     pub async fn update_mempool(self_: Arc<Mutex<Self>>) -> Result<(), JdsMempoolError> {
-        let client = self_
-            .safe_lock(|x| x.get_client())?
-            .ok_or(JdsMempoolError::NoClient)?;
+        let client_exists = self_.safe_lock(|x| x.client.is_some())?;
+        if !client_exists {
+            return Err(JdsMempoolError::NoClient);
+        }
 
-        let mempool = client.get_raw_mempool().await?;
-
-        let raw_mempool_txids: Result<Vec<Txid>, _> = mempool
-            .into_iter()
-            .map(|id| {
-                Txid::from_str(&id)
-                    .map_err(|err| JdsMempoolError::Rpc(RpcError::Deserialization(err.to_string())))
-            })
-            .collect();
-
-        let raw_mempool_txids = raw_mempool_txids?;
+        // Fetch raw mempool from Bitcoin node
+        let self_clone = self_.clone();
+        let raw_mempool_txids = tokio::task::spawn_blocking(move || {
+            self_clone
+                .safe_lock(|a| {
+                    if let Some(client) = &a.client {
+                        client.get_raw_mempool()
+                    } else {
+                        Err(bitcoincore_rpc::Error::JsonRpc(
+                            bitcoincore_rpc::jsonrpc::Error::Transport(Box::new(
+                                std::io::Error::new(std::io::ErrorKind::NotConnected, "No client"),
+                            )),
+                        ))
+                    }
+                })
+                .map_err(|e| JdsMempoolError::PoisonLock(e.to_string()))?
+                .map_err(JdsMempoolError::Rpc)
+        })
+        .await
+        .map_err(|e| JdsMempoolError::PoisonLock(e.to_string()))??;
 
         // Holding the lock till the light mempool updation is complete.
         let is_mempool_empty = self_.safe_lock(|x| {
@@ -187,15 +244,43 @@ impl JDsMempool {
     pub async fn on_submit(self_: Arc<Mutex<Self>>) -> Result<(), JdsMempoolError> {
         let new_block_receiver: Receiver<String> =
             self_.safe_lock(|x| x.new_block_receiver.clone())?;
-        let client = self_
-            .safe_lock(|x| x.get_client())?
-            .ok_or(JdsMempoolError::NoClient)?;
+
+        let client_exists = self_.safe_lock(|x| x.client.is_some())?;
+        if !client_exists {
+            return Err(JdsMempoolError::NoClient);
+        }
 
         while let Ok(block_hex) = new_block_receiver.recv().await {
-            match mini_rpc_client::MiniRpcClient::submit_block(&client, block_hex).await {
+            let self_clone = self_.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                self_clone
+                    .safe_lock(|a| {
+                        if let Some(client) = &a.client {
+                            client.submit_block_hex(&block_hex)
+                        } else {
+                            Err(bitcoincore_rpc::Error::JsonRpc(
+                                bitcoincore_rpc::jsonrpc::Error::Transport(Box::new(
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "No client",
+                                    ),
+                                )),
+                            ))
+                        }
+                    })
+                    .map_err(|e| JdsMempoolError::PoisonLock(e.to_string()))?
+                    .map_err(JdsMempoolError::Rpc)
+            })
+            .await
+            .map_err(|e| JdsMempoolError::PoisonLock(e.to_string()))?;
+
+            match result {
                 Ok(_) => return Ok(()),
-                Err(e) => JdsMempoolError::Rpc(e),
-            };
+                Err(e) => {
+                    tracing::error!("Failed to submit block: {:?}", e);
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }

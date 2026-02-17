@@ -5,7 +5,7 @@
 //! It unifies errors from:
 //! - I/O operations
 //! - Channels (send/recv)
-//! - SV2 stack: Binary, Codec, Noise, Framing, RolesLogic
+//! - SV2 stack: Binary, Codec, Noise, Framing
 //! - Mempool layer
 //! - Locking logic (PoisonError)
 //! - Domain-specific issues (e.g., missing job, invalid URL, reconstruction failures)
@@ -19,10 +19,11 @@ use std::{
     sync::{MutexGuard, PoisonError},
 };
 
-use stratum_common::roles_logic_sv2::{
-    self,
-    codec_sv2::{self, binary_sv2, noise_sv2},
-    parsers_sv2::Mining,
+use stratum_apps::stratum_core::{
+    binary_sv2, codec_sv2, framing_sv2,
+    handlers_sv2::HandlerErrorType,
+    noise_sv2,
+    parsers_sv2::{Mining, ParserError},
 };
 
 use crate::mempool::error::JdsMempoolError;
@@ -35,8 +36,7 @@ pub enum JdsError {
     BinarySv2(binary_sv2::Error),
     Codec(codec_sv2::Error),
     Noise(noise_sv2::Error),
-    RolesLogic(roles_logic_sv2::Error),
-    Framing(codec_sv2::framing_sv2::Error),
+    Framing(framing_sv2::Error),
     PoisonLock(String),
     Custom(String),
     Sv2ProtocolError((u32, Mining<'static>)),
@@ -45,6 +45,16 @@ pub enum JdsError {
     NoLastDeclaredJob,
     InvalidRPCUrl,
     BadCliArgs,
+    /// Unexpected message received
+    UnexpectedMessage(u16, u8),
+    /// Parser error
+    Parser(ParserError),
+    /// Transaction decoding error
+    TxDecodingError(String),
+    /// Missing transactions in JDS
+    JDSMissingTransactions,
+    /// No valid job available
+    NoValidJob,
 }
 
 impl std::fmt::Display for JdsError {
@@ -58,7 +68,6 @@ impl std::fmt::Display for JdsError {
             Codec(ref e) => write!(f, "Codec SV2 error: `{e:?}"),
             Framing(ref e) => write!(f, "Framing SV2 error: `{e:?}`"),
             Noise(ref e) => write!(f, "Noise SV2 error: `{e:?}"),
-            RolesLogic(ref e) => write!(f, "Roles Logic SV2 error: `{e:?}`"),
             PoisonLock(ref e) => write!(f, "Poison lock: {e:?}"),
             Custom(ref e) => write!(f, "Custom SV2 error: `{e:?}`"),
             Sv2ProtocolError(ref e) => {
@@ -71,6 +80,16 @@ impl std::fmt::Display for JdsError {
             NoLastDeclaredJob => write!(f, "Last declared job not found"),
             InvalidRPCUrl => write!(f, "Invalid Template Provider RPC URL"),
             BadCliArgs => write!(f, "Bad CLI arg input"),
+            UnexpectedMessage(ext_type, msg_type) => {
+                write!(
+                    f,
+                    "Unexpected message: ext_type={ext_type}, msg_type={msg_type}"
+                )
+            }
+            Parser(ref e) => write!(f, "Parser error: `{e:?}`"),
+            TxDecodingError(ref e) => write!(f, "Transaction decoding error: `{e}`"),
+            JDSMissingTransactions => write!(f, "JD server missing transactions"),
+            NoValidJob => write!(f, "No valid job available"),
         }
     }
 }
@@ -105,12 +124,6 @@ impl From<noise_sv2::Error> for JdsError {
     }
 }
 
-impl From<roles_logic_sv2::Error> for JdsError {
-    fn from(e: roles_logic_sv2::Error) -> JdsError {
-        JdsError::RolesLogic(e)
-    }
-}
-
 impl<T: 'static + std::marker::Send + Debug> From<async_channel::SendError<T>> for JdsError {
     fn from(e: async_channel::SendError<T>) -> JdsError {
         JdsError::ChannelSend(Box::new(e))
@@ -122,8 +135,9 @@ impl From<String> for JdsError {
         JdsError::Custom(e)
     }
 }
-impl From<codec_sv2::framing_sv2::Error> for JdsError {
-    fn from(e: codec_sv2::framing_sv2::Error) -> JdsError {
+
+impl From<framing_sv2::Error> for JdsError {
+    fn from(e: framing_sv2::Error) -> JdsError {
         JdsError::Framing(e)
     }
 }
@@ -143,5 +157,23 @@ impl From<(u32, Mining<'static>)> for JdsError {
 impl From<JdsMempoolError> for JdsError {
     fn from(error: JdsMempoolError) -> Self {
         JdsError::MempoolError(error)
+    }
+}
+
+impl From<ParserError> for JdsError {
+    fn from(e: ParserError) -> Self {
+        JdsError::Parser(e)
+    }
+}
+
+/// Implementation of HandlerErrorType for JdsError
+/// Required by the new handlers_sv2 API
+impl HandlerErrorType for JdsError {
+    fn unexpected_message(extension_type: u16, message_type: u8) -> Self {
+        JdsError::UnexpectedMessage(extension_type, message_type)
+    }
+
+    fn parse_error(error: ParserError) -> Self {
+        JdsError::Parser(error)
     }
 }

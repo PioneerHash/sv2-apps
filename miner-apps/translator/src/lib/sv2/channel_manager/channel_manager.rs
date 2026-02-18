@@ -480,12 +480,37 @@ impl ChannelManager {
                     })?;
             }
             Mining::SubmitSharesExtended(mut m) => {
+                // In developer mode, skip PoW validation entirely since simulated miners
+                // (like mujina with --force-rate) don't produce real proof-of-work.
+                // The share is forwarded upstream where JDC's developer mode will also
+                // skip validation before sending to the pool.
+                #[cfg(feature = "developer_mode")]
+                let is_developer_mode = true;
+                #[cfg(not(feature = "developer_mode"))]
+                let is_developer_mode = false;
+
                 let value =
                     self.extended_channels
                         .get_mut(&m.channel_id)
                         .map(|mut extended_channel| {
+                            // In developer mode, skip validate_share and treat as valid
+                            let validation_result = if is_developer_mode {
+                                debug!("Developer mode: skipping PoW validation for SV2 share on channel {}", m.channel_id);
+                                use stratum_apps::stratum_core::channels_sv2::client::share_accounting::ShareValidationResult;
+                                use stratum_apps::stratum_core::bitcoin::hashes::{sha256d, Hash};
+                                // Create a unique hash from share data to avoid duplicate detection
+                                let mut data = Vec::with_capacity(24);
+                                data.extend_from_slice(&m.channel_id.to_le_bytes());
+                                data.extend_from_slice(&m.sequence_number.to_le_bytes());
+                                data.extend_from_slice(&m.nonce.to_le_bytes());
+                                data.extend_from_slice(&m.ntime.to_le_bytes());
+                                let dev_hash = sha256d::Hash::hash(&data);
+                                Ok(ShareValidationResult::Valid(dev_hash))
+                            } else {
+                                extended_channel.validate_share(m.clone())
+                            };
                             (
-                                extended_channel.validate_share(m.clone()),
+                                validation_result,
                                 extended_channel.get_share_accounting().clone(),
                             )
                         });

@@ -673,7 +673,7 @@ impl ChannelManager {
     /// and either forwarding them to the appropriate subsystem or updating  
     /// the internal state of the Channel Manager as needed.
     pub async fn start(
-        self,
+        mut self,
         cancellation_token: CancellationToken,
         fallback_coordinator: FallbackCoordinator,
         status_sender: Sender<Status>,

@@ -8,7 +8,7 @@ use stratum_apps::stratum_core::sv1_api::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    error, is_aggregated,
+    is_aggregated,
     sv1::{downstream::SubmitShareWithChannelId, Sv1Server},
     utils::{validate_sv1_share, AGGREGATED_CHANNEL_ID},
 };
@@ -145,52 +145,8 @@ impl IsServer<'static> for Sv1Server {
         // Look up the job by job_id. In developer mode, if not found, fall back to the
         // most recent valid job. This allows simulated miners (like mujina with --force-rate)
         // that use fake job_ids to still submit shares for testing.
+        #[cfg(feature = "developer_mode")]
         let developer_mode = self.config.downstream_difficulty_config.is_developer_mode();
-
-        let job = self.sv1_server_data.super_safe_lock(|data| {
-            // First, try to find the job by exact job_id match
-            let exact_match = data
-                .aggregated_valid_jobs
-                .as_ref()
-                .and_then(|jobs| jobs.iter().find(|j| &j.job_id == job_id))
-                .or_else(|| {
-                    data.non_aggregated_valid_jobs
-                        .as_ref()
-                        .and_then(|jobs| jobs.get(&channel_id))
-                        .and_then(|jobs| jobs.iter().find(|j| &j.job_id == job_id))
-                })
-                .cloned();
-
-            if exact_match.is_some() {
-                return exact_match;
-            }
-
-            // In developer mode, fall back to the most recent valid job
-            #[cfg(feature = "developer_mode")]
-            if developer_mode {
-                let fallback = data
-                    .aggregated_valid_jobs
-                    .as_ref()
-                    .and_then(|jobs| jobs.last())
-                    .or_else(|| {
-                        data.non_aggregated_valid_jobs
-                            .as_ref()
-                            .and_then(|jobs| jobs.get(&channel_id))
-                            .and_then(|jobs| jobs.last())
-                    })
-                    .cloned();
-
-                if fallback.is_some() {
-                    debug!(
-                        "Developer mode: job_id {} not found, using fallback job for channel {}",
-                        job_id, channel_id
-                    );
-                }
-                return fallback;
-            }
-
-            None
-        });
 
         let find_job =
             |jobs: &[Notify<'static>]| jobs.iter().find(|j| j.job_id == *job_id).cloned();
@@ -200,12 +156,30 @@ impl IsServer<'static> for Sv1Server {
             .get(&channel_id)
             .and_then(|jobs| find_job(jobs.as_ref()));
 
+        // In developer mode, fall back to the most recent valid job if exact match not found
+        #[cfg(feature = "developer_mode")]
+        let job = job.or_else(|| {
+            if developer_mode {
+                let fallback = self
+                    .valid_sv1_jobs
+                    .get(&channel_id)
+                    .and_then(|jobs| jobs.last().cloned());
+
+                if fallback.is_some() {
+                    debug!(
+                        "Developer mode: job_id {} not found, using fallback job for channel {}",
+                        job_id, channel_id
+                    );
+                }
+                fallback
+            } else {
+                None
+            }
+        });
+
         let Some(job) = job else {
             return false;
         };
-
-        // Suppress unused variable warning when developer_mode feature is not enabled
-        let _ = developer_mode;
 
         downstream.downstream_data.super_safe_lock(|data| {
             let channel_id = match data.channel_id {

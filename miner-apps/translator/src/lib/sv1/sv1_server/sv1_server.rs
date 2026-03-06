@@ -735,34 +735,26 @@ impl Sv1Server {
                             }
                         }
 
-                        // After processing queued messages, send RegisterChannelPubkey
-                        // if the handshake completed and we have an hpub
-                        let (handshake_complete, user_identity) =
-                            downstream.downstream_data.super_safe_lock(|d| {
-                                let complete = d
-                                    .sv1_handshake_complete
-                                    .load(std::sync::atomic::Ordering::SeqCst);
-                                (complete, d.user_identity.clone())
-                            });
+                        // After processing queued messages (which includes mining.authorize),
+                        // send RegisterChannelPubkey if we have an hpub in the user_identity
+                        let user_identity = downstream
+                            .downstream_data
+                            .super_safe_lock(|d| d.user_identity.clone());
 
-                        if handshake_complete {
-                            if let Some(pubkey) =
-                                ehash_core::parse_hpub_from_username(&user_identity)
+                        if let Some(pubkey) = ehash_core::parse_hpub_from_username(&user_identity) {
+                            info!(
+                                "Sending RegisterChannelPubkey after channel open for channel_id={}, pubkey={}",
+                                m.channel_id,
+                                pubkey.to_bech32()
+                            );
+                            if let Err(e) = self
+                                .send_register_channel_pubkey(m.channel_id, pubkey)
+                                .await
                             {
-                                info!(
-                                    "Sending RegisterChannelPubkey after channel open for channel_id={}, pubkey={}",
-                                    m.channel_id,
-                                    pubkey.to_bech32()
+                                warn!(
+                                    "Failed to send RegisterChannelPubkey for channel {}: {:?}",
+                                    m.channel_id, e
                                 );
-                                if let Err(e) = self
-                                    .send_register_channel_pubkey(m.channel_id, pubkey)
-                                    .await
-                                {
-                                    warn!(
-                                        "Failed to send RegisterChannelPubkey for channel {}: {:?}",
-                                        m.channel_id, e
-                                    );
-                                }
                             }
                         }
                     }

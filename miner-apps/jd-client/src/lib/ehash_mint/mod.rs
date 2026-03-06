@@ -537,10 +537,15 @@ async fn connect_to_mint(
     // We need to import the NoiseTcpStream type for EhashMessage
     use stratum_apps::network_helpers::noise_stream::NoiseTcpStream;
 
-    let noise_stream =
-        NoiseTcpStream::<EhashMessage<'static>>::new(stream, HandshakeRole::Initiator(initiator))
-            .await
-            .map_err(|e| format!("Noise handshake failed: {:?}", e))?;
+    // Use a 30 second timeout for noise handshake
+    let handshake_timeout = std::time::Duration::from_secs(30);
+    let noise_stream = NoiseTcpStream::<EhashMessage<'static>>::new(
+        stream,
+        HandshakeRole::Initiator(initiator),
+        handshake_timeout,
+    )
+    .await
+    .map_err(|e| format!("Noise handshake failed: {:?}", e))?;
 
     // We only need the write half for fire-and-forget
     let (_read_half, write_half) = noise_stream.into_split();

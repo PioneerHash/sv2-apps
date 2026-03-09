@@ -1325,7 +1325,8 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         };
                         is_downstream_share_valid = true;
                         ehash_share_hash = Some(share_hash.to_byte_array());
-                        ehash_block_found = true;
+                        // Only report block found if we're solo mining (we get the coinbase)
+                        ehash_block_found = get_jd_mode() == JdMode::SoloMining;
                         messages.push((
                             downstream.downstream_id,
                             Mining::SubmitSharesSuccess(success),

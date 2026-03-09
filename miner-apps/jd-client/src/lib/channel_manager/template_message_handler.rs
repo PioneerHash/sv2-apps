@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     channel_manager::{downstream_message_handler::RouteMessageTo, ChannelManager, DeclaredJob},
+    ehash_mint::ChainTipUpdateData,
     error::{self, JDCError, JDCErrorKind},
     jd_mode::{get_jd_mode, JdMode},
 };
@@ -448,6 +449,23 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
 
         let (messages, token_consumed) = self.channel_manager_data.super_safe_lock(|channel_manager_data| {
             channel_manager_data.last_new_prev_hash = Some(msg.clone().into_static());
+            
+            // Send chain tip update to ehash-mint in solo mining mode
+            // This enables confirmation counting and orphan detection
+            if get_jd_mode() == JdMode::SoloMining {
+                let prev_hash_bytes: [u8; 32] = msg.prev_hash.inner_as_ref()
+                    .try_into()
+                    .expect("prev_hash should be 32 bytes");
+                
+                let update = ChainTipUpdateData {
+                    prev_hash: prev_hash_bytes,
+                    height: channel_manager_data.estimated_block_height,
+                };
+                
+                channel_manager_data.ehash_report_sender.try_send_chain_tip(update);
+                channel_manager_data.estimated_block_height += 1;
+            }
+            
             channel_manager_data.last_declare_job_store.iter_mut().for_each(|(_k, v)| {
                 if v.template.future_template && v.template.template_id == msg.template_id {
                     v.prev_hash = Some(msg.clone().into_static());
